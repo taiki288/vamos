@@ -4,12 +4,27 @@
 
 ### Install Packages and Download VLM
 
-First follow the install steps in [README.md](README.md).
+First follow the uv install steps in [README.md](README.md) for the Python/ML
+dependencies:
+
+```bash
+uv sync --group dev --group ros
+```
+
+`uv` can install this repository's Python dependencies and local editable
+packages, but it cannot install ROS Noetic itself or ROS message packages such
+as `rospy`, `sensor_msgs`, `geometry_msgs`, `cv_bridge`, and `tf2_ros` from
+PyPI. You still need a ROS Noetic environment from RoboStack, apt, or an
+existing system installation before running the ROS nodes.
+
+If you use RoboStack, keep the original Conda environment flow from the
+README's Conda alternative section.
+
 IMPORTANT: Make sure to find and set the vlm path from the model download in the config file.
 
 ```bash
 chmod +x ./setup.sh
-./setup.sh  # By default this downloads the navigation_only (i.e. non-steerable) model which we used in our navigation experiments, but feel free to download the steerable one from mateoguaman/vamos 
+./setup.sh  # Downloads the navigation_only model with uv run by default.
 cd vamos_ws
 catkin build
 source devel/setup.bash

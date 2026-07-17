@@ -14,7 +14,36 @@ This is the inference and deployment repo for [VAMOS](https://vamos-vla.github.i
    cd vamos
    ```
 
-2. **Set up the environment**:
+2. **Set up the environment with uv**:
+
+This repository is configured as a uv project. Use `uv sync` instead of
+`uv pip install`.
+
+For a minimal Python/ML installation:
+
+   ```bash
+   uv sync
+   ```
+
+If you also want the notebook tools:
+
+   ```bash
+   uv sync --group dev
+   ```
+
+Run commands through the uv environment:
+
+   ```bash
+   uv run python vamos_demo.py
+   uv run jupyter notebook vamos_demo.ipynb
+   ```
+
+The local `trajectory_prediction` and `trajectory_projection` packages are
+installed as editable path dependencies by uv.
+
+### Conda Alternative
+
+If you prefer the original Conda flow:
 
 For a minimal installation, either run:
    ```bash
@@ -40,13 +69,13 @@ We use ROS noetic from RoboStack for better portability.
 Test the VLM model with sample images:
 
 ```bash
-python vamos_demo.py
+uv run python vamos_demo.py
 ```
 
 Or use the Jupyter notebook for interactive testing:
 
 ```bash
-jupyter notebook vamos_demo.ipynb
+uv run jupyter notebook vamos_demo.ipynb
 ```
 
 You can access the same notebook on Colab directly from the url at the top of this README.

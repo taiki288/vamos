@@ -1,9 +1,8 @@
-cd vamos_ws/src
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Install trajectory packages
-pip install -e trajectory_prediction/
-pip install -e trajectory_projection/
+uv sync --frozen
 
-cd vamos_src/src/vamos
-
-python dowload_hf_model.py --model_id "mateoguaman/vamos_navigation_only"
+uv run --frozen python \
+  vamos_ws/src/vamos/src/vamos/dowload_hf_model.py \
+  --model_id "mateoguaman/vamos_navigation_only"
