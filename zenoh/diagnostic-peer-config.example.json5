@@ -1,0 +1,5 @@
+{
+  // Relative paths are resolved against this file's directory.
+  image_path: "../test_images/texas_person.jpg",
+  publish_frequency_hz: 5.0,
+}

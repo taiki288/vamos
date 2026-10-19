@@ -33,6 +33,10 @@ dependencies = [
 ]
 
 [dependency-groups]
+zenoh = [
+    "eclipse-zenoh>=1.0,<2",
+    "json5>=0.9",
+]
 dev = [
     "ipykernel>=6.20.0",
     "jupyter>=1.0.0",
