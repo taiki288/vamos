@@ -64,6 +64,7 @@ class VAMOSEngine:
             temperature=self.config.temperature,
             num_samples=self.config.num_samples,
             device=self.device,
+            disable_compile=self.config.disable_compile,
         )
         if self.device.startswith("cuda"):
             torch.cuda.synchronize()

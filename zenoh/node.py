@@ -276,7 +276,8 @@ class NodeRuntime:
                         LOGGER.info("Published inference=%d frame=%d paths=%d %.3fs %s",
                                     result.inference_id, result.frame_sequence, len(result.trajectories), duration, output.device)
                     else:
-                        LOGGER.info("Discarded inference=%d after stop, stale input, or shutdown", result.inference_id)
+                        LOGGER.info("Discarded inference=%d %.3fs source_age=%.3fs after stop, stale input, or shutdown",
+                                    result.inference_id, duration, result.source_age_seconds)
                 except Exception as error:
                     self.state.fail_inference(error, request)
                     LOGGER.exception("VAMOS inference failed; paused until start or restart")

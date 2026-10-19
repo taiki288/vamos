@@ -3,7 +3,9 @@ from __future__ import annotations
 import copy
 from io import BytesIO
 from pathlib import Path
+import socket
 import sys
+import time
 from types import SimpleNamespace
 import unittest
 
@@ -38,6 +40,20 @@ def image_bytes(fmt="JPEG"):
 
 def sample(payload, encoding):
     return SimpleNamespace(encoding=encoding, payload=SimpleNamespace(to_bytes=lambda: payload))
+
+
+def wait_for_listener(endpoint: str, timeout: float = 5.0):
+    """Wait for an actual TCP listener, not a scheduler-dependent fixed sleep."""
+    host, port = endpoint.removeprefix("tcp/").rsplit(":", 1)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with socket.create_connection((host, int(port)), timeout=0.1):
+                return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Listener did not become ready: {endpoint}")
+            time.sleep(0.01)
 
 
 class TransportTests(unittest.TestCase):

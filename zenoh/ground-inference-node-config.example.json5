@@ -10,6 +10,7 @@
     num_samples: 10,
     max_new_tokens: 10,
     temperature: 0.05,
+    disable_compile: true,
     frequency_hz: 1.0,
     max_frame_age_seconds: 5.0,
     shutdown_timeout_seconds: 30.0,

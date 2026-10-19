@@ -63,6 +63,7 @@ class InferenceConfig(Settings):
     num_samples: Annotated[int, Field(strict=True, ge=1, le=50)] = 10
     max_new_tokens: Annotated[int, Field(strict=True, ge=2, le=128)] = 10
     temperature: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.05
+    disable_compile: StrictBool = True
     frequency_hz: PositiveSeconds = 1.0
     max_frame_age_seconds: PositiveSeconds = 5.0
     shutdown_timeout_seconds: PositiveSeconds = 30.0

@@ -122,7 +122,7 @@ def decode_trajectory_string(trajectory_string, img_height, img_width, expected_
     return coords_tensor
 
 def generate_trajectories(model, processor, image, text_prompt, max_tokens=10, temperature=0.1, 
-                         top_k=0, num_beams=1, num_samples=3, device="cpu"):
+                         top_k=0, num_beams=1, num_samples=3, device="cpu", disable_compile=None):
     """
     Generate trajectories using the loaded model.
     
@@ -137,6 +137,8 @@ def generate_trajectories(model, processor, image, text_prompt, max_tokens=10, t
         num_beams: Number of beams for beam search
         num_samples: Number of samples to generate
         device: Device to run inference on
+        disable_compile: Optional generation override; streaming inference uses
+            True to avoid compilation delays invalidating fresh image results
     
     Returns:
         tuple: (trajectories, generated_texts, error_message)
@@ -159,8 +161,11 @@ def generate_trajectories(model, processor, image, text_prompt, max_tokens=10, t
             "num_return_sequences": num_samples
         }
 
-        # Windows CUDA inference must not require Triton for auto-compilation.
-        if sys.platform == "win32" and str(device).startswith("cuda"):
+        # Streaming inference opts out explicitly for predictable latency. Keep
+        # the standalone demo's existing Windows CUDA/Triton fallback as well.
+        if disable_compile is not None:
+            generation_kwargs["disable_compile"] = disable_compile
+        elif sys.platform == "win32" and str(device).startswith("cuda"):
             generation_kwargs["disable_compile"] = True
         
         if temperature > 0:

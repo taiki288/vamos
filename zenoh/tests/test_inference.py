@@ -21,7 +21,7 @@ import zenoh
 from config import ControlCommand, InferenceConfig, NodeConfig, NodeState, TrajectoryResult
 from inference import InferenceOutput, VAMOSEngine, build_prompt, render_preview
 from node import NodeRuntime, TransportState
-from test_transport import BASE_CONFIG, image_bytes
+from test_transport import BASE_CONFIG, image_bytes, wait_for_listener
 
 
 INFERENCE = {"goal": {"x": 0.434, "y": 0.514}, "device": "cpu", "frequency_hz": 20.0}
@@ -45,7 +45,8 @@ class InferenceTests(unittest.TestCase):
 
     def test_invalid_generation_configs_fail_before_loading_model(self):
         for changes in ({"temperature": 0.0, "num_samples": 10}, {"max_new_tokens": 9},
-                        {"goal": {"x": 1.1, "y": 0.5}}, {"frequency_hz": 1e-320}):
+                        {"goal": {"x": 1.1, "y": 0.5}}, {"frequency_hz": 1e-320},
+                        {"disable_compile": "yes"}):
             with self.subTest(changes=changes), self.assertRaises(ValidationError):
                 InferenceConfig.model_validate({**INFERENCE, **changes})
 
@@ -107,6 +108,14 @@ class InferenceTests(unittest.TestCase):
         output = engine.infer(Image.new("RGB", (64, 48)))
         self.assertEqual(output.trajectories, [[[1, 2], [20, 30]]])
         self.assertEqual(output.generated_texts, ["valid"])
+        self.assertIs(generate.call_args.kwargs["disable_compile"], True)
+
+    def test_explicit_compilation_preference_reaches_the_generator(self):
+        generate = Mock(return_value=([[[1, 2], [20, 30]]], ["valid"], None))
+        config = self.config.inference.model_copy(update={"disable_compile": False})
+        engine = VAMOSEngine(None, None, "cpu", generate, config)
+        engine.infer(Image.new("RGB", (64, 48)))
+        self.assertIs(generate.call_args.kwargs["disable_compile"], False)
 
     def test_preview_uses_source_dimensions_and_result_json_round_trips(self):
         result = TrajectoryResult(
@@ -156,6 +165,7 @@ class InferenceNetworkTests(unittest.TestCase):
         worker = Thread(target=run, daemon=True)
         worker.start()
         try:
+            wait_for_listener(endpoint)
             client = zenoh.Config.from_json5(json.dumps({"mode": "client", "connect": {"endpoints": [endpoint]},
                                                         "scouting": {"multicast": {"enabled": False}}}))
             with zenoh.open(client) as session, ExitStack() as resources:

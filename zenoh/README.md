@@ -60,6 +60,9 @@ The inference example requires CUDA, uses `mateoguaman/vamos`, and generates
 instruction from `vamos_demo.py`. Edit a local copy of the configuration to change
 the model, device (`cuda`, `cpu`, `auto`), goal, candidate count, or inference rate.
 `device: cuda` fails explicitly instead of silently falling back to CPU.
+`inference.disable_compile` defaults to true for predictable streaming latency;
+it is passed explicitly to generation. Set it to false only when evaluating
+compiled inference, including its initialization and repeated-call overhead.
 
 State publication continues while the model loads or inference is running.
 Once loaded, inference starts automatically on a fresh image and heartbeat; Go2
@@ -247,3 +250,42 @@ Run unit and real localhost, separate-process transport tests:
 ```console
 uv run --group zenoh python -m unittest discover -s zenoh/tests -v
 ```
+
+## Linux / WSL2 validation
+
+Use a separate checkout and virtual environment inside the Linux filesystem;
+do not reuse the Windows `.venv`. From the Linux checkout, with Linux uv on PATH:
+
+```console
+uv sync --locked --group zenoh --python 3.11
+uv run --frozen --group zenoh python -m unittest discover -s zenoh/tests -v
+uv run --frozen python zenoh/simulator.py --headless
+uv run --frozen --group zenoh python zenoh/projection_demo.py --infer --headless --output-dir outputs/projection
+```
+
+The existing node/peer/viewer/simulator commands also apply on Linux. Start the
+node first and wait for `Transport ready` before launching clients. Model load
+continues in the background. The TCP tests wait for the listener explicitly;
+starting a thread/process alone does not guarantee it is accepting connections.
+
+The lock file selects platform-specific Torch builds: the Windows AMD64 CUDA
+12.8 source override does not apply to Linux. Check `torch.cuda.is_available()`
+in the Linux environment before GPU checks. With Torch 2.13, automatic generation
+compilation exceeded the freshness window in local checks. Streaming adapters
+therefore disable compilation by default on every platform, preserving the
+expiry limits rather than treating old results as usable. The standalone demo
+retains its previous default unless a caller explicitly overrides compilation.
+
+If reusing downloaded weights from Windows, set `HF_HUB_CACHE` to that hub
+directory as seen under `/mnt/c`. `HF_HUB_OFFLINE=1` and
+`TRANSFORMERS_OFFLINE=1` can then verify cache-only inference. Otherwise the
+normal Hugging Face model download applies. This does not require sharing the
+Python environment between Windows and Linux.
+
+Validated on Ubuntu 24.04 under WSL2 x86_64 with RTX 5060: Python 3.11.17,
+Torch 2.13.0+cu130, all 61 tests on both Linux and Windows, real 10-path
+inference/projection/following, and WSLg Matplotlib/TkAgg and OpenCV window
+creation. Real three-process checks received four 10-path updates for each of
+the two bundled images and stopped simulated motion after the image fixture
+exited. This is x86_64 Linux validation, not Jetson/aarch64 or physical Go2
+validation.

@@ -23,7 +23,7 @@ from inference import InferenceOutput
 from node import NodeRuntime, TransportState
 from projection import GroundCamera
 from stream_simulator import StreamFollower, StreamView, run_session
-from test_transport import BASE_CONFIG, image_bytes, sample
+from test_transport import BASE_CONFIG, image_bytes, sample, wait_for_listener
 
 
 CAMERA = GroundCamera(64, 48, 32, 32, 32, 24, 0.5)
@@ -213,6 +213,7 @@ class StreamNetworkTests(unittest.TestCase):
 
         def follower_run():
             try:
+                wait_for_listener(endpoint)
                 run_session(follower, config.keys(), zenoh.Config.from_json5(client_json),
                             stop_follower, headless=True, duration=8)
             except Exception as error:
@@ -223,6 +224,7 @@ class StreamNetworkTests(unittest.TestCase):
         node_thread.start()
         follow_thread.start()
         try:
+            wait_for_listener(endpoint)
             with zenoh.open(zenoh.Config.from_json5(client_json)) as session, ExitStack() as resources:
                 resources.enter_context(session.declare_subscriber("unitree/go2/command", lambda s: commands.put(s.payload.to_bytes())))
                 camera_pub = resources.enter_context(session.declare_publisher("camera/front", encoding="image/jpeg"))
