@@ -16,7 +16,7 @@ import zenoh
 from PIL import Image
 from pydantic import StrictStr, field_validator
 
-from config import JPEG_ENCODING, JSON_ENCODING, NodeState, PositiveSeconds, Settings, load_node_config
+from config import JPEG_ENCODING, JSON_ENCODING, NodeState, PositiveSeconds, Settings, TrajectoryResult, load_node_config
 from node import HERE, stop_on_signals
 
 
@@ -50,6 +50,7 @@ def main() -> int:
         keys = config.keys()
         latest: NodeState | None = None
         latest_at: float | None = None
+        last_result: TrajectoryResult | None = None
         lock = Lock()
 
         def on_state(sample):
@@ -63,10 +64,22 @@ def main() -> int:
             except ValueError as error:
                 logging.warning("Invalid VAMOS state: %s", error)
 
+        def on_trajectories(sample):
+            nonlocal last_result
+            try:
+                if str(sample.encoding).split(";", 1)[0] != JSON_ENCODING:
+                    raise ValueError("expected application/json")
+                result = TrajectoryResult.model_validate_json(sample.payload.to_bytes())
+                with lock:
+                    last_result = result
+            except ValueError as error:
+                logging.warning("Invalid VAMOS trajectories: %s", error)
+
         # This fixture describes an idle robot; it never publishes Go2 commands.
         fake_go2 = '{"robot_connected":true,"robot_state":{"state":"down","motion":"quiescent"},"accepting_commands":true}'
         with stop_on_signals() as stop, zenoh.open(zenoh.Config.from_file(str(args.zenoh_config))) as session, ExitStack() as resources:
             resources.enter_context(session.declare_subscriber(keys["state"], on_state))
+            resources.enter_context(session.declare_subscriber(keys["trajectories"], on_trajectories))
             camera = resources.enter_context(session.declare_publisher(keys["camera"], encoding=JPEG_ENCODING))
             go2 = resources.enter_context(session.declare_publisher(keys["go2_state"], encoding=JSON_ENCODING))
             control = resources.enter_context(session.declare_publisher(keys["command"], encoding=JSON_ENCODING))
@@ -81,13 +94,22 @@ def main() -> int:
                 now = time.monotonic()
                 if now >= next_report:
                     with lock:
-                        state, received_at = latest, latest_at
+                        state, received_at, result = latest, latest_at, last_result
                     if state is None or now - received_at > 2.0:
                         logging.info("Waiting for fresh VAMOS state...")
                     else:
                         logging.info("frames=%d %sx%s camera_fresh=%s go2_fresh=%s heartbeat=%s",
                                      state.camera.received_frames, state.camera.width, state.camera.height,
                                      state.camera.fresh, state.go2.fresh, state.cli_connected)
+                        if state.stage == "inference":
+                            logging.info("model_loaded=%s active=%s completed=%d discarded=%d error=%s",
+                                         state.inference.model_loaded, state.inference.active,
+                                         state.inference.completed, state.inference.discarded,
+                                         state.inference.last_error)
+                            if result is not None:
+                                logging.info("inference=%d frame=%d paths=%d %.3fs %s",
+                                             result.inference_id, result.frame_sequence,
+                                             len(result.trajectories), result.duration_seconds, result.device)
                     next_report = now + 1.0
                 deadline += (max(0, math.floor((now - deadline) / period)) + 1) * period
                 stop.wait(max(0.0, deadline - time.monotonic()))

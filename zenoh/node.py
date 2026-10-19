@@ -1,4 +1,4 @@
-"""Receive camera/Go2 observations and publish VAMOS transport state."""
+"""Receive camera/Go2 observations and optionally run VAMOS image-path inference."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from threading import Event, Lock, RLock
+from threading import Event, Lock, RLock, Thread
 from typing import Callable
 
 import zenoh
@@ -19,7 +19,7 @@ from PIL import Image
 
 from config import (
     CameraState, ControlCommand, Go2NodeState, Go2State, JPEG_ENCODING,
-    JSON_ENCODING, NodeConfig, NodeState, load_node_config,
+    JSON_ENCODING, InferenceState, NodeConfig, NodeState, TrajectoryResult, load_node_config,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -31,6 +31,13 @@ class ReceivedFrame:
     sequence: int
     received_at: float
     image: Image.Image
+
+
+@dataclass(frozen=True)
+class InferenceRequest:
+    inference_id: int
+    epoch: int
+    frame: ReceivedFrame
 
 
 class TransportState:
@@ -49,6 +56,19 @@ class TransportState:
         self._last_command: str | None = None
         self._rejected = {"camera": 0, "go2": 0, "command": 0}
         self._stopped = False
+        self._shutting_down = False
+        self._inference_enabled = config.inference is not None
+        self._model_loaded = False
+        self._device: str | None = None
+        self._active = False
+        self._epoch = 0
+        self._request_id = 0
+        self._last_input: tuple[int, int] | None = None
+        self._completed = 0
+        self._discarded = 0
+        self._last_inference_frame: int | None = None
+        self._last_duration: float | None = None
+        self._inference_error: str | None = None
 
     def receive_frame(self, image: Image.Image, received_at: float) -> None:
         with self._lock:
@@ -71,6 +91,16 @@ class TransportState:
 
     def receive_command(self, command: ControlCommand) -> None:
         with self._lock:
+            if command.type == "start":
+                if self.config.inference is None or not self._model_loaded or self._shutting_down:
+                    raise ValueError("inference is not available; navigation start is not implemented")
+                if not self._inference_enabled:
+                    self._epoch += 1
+                self._inference_enabled = True
+                self._inference_error = None
+            elif command.type == "stop":
+                self._inference_enabled = False
+                self._epoch += 1
             self._command_count += 1
             self._last_command = command.type
             if command.type == "heartbeat":
@@ -83,6 +113,64 @@ class TransportState:
     def mark_stopped(self) -> None:
         with self._lock:
             self._stopped = True
+            self._inference_enabled = False
+            self._epoch += 1
+
+    def request_shutdown(self) -> None:
+        with self._lock:
+            self._shutting_down = True
+            self._inference_enabled = False
+            self._epoch += 1
+
+    def model_loaded(self, device: str) -> None:
+        with self._lock:
+            self._model_loaded = True
+            self._device = device
+
+    def begin_inference(self) -> InferenceRequest | None:
+        with self._lock:
+            if (self.config.inference is None or not self._model_loaded or not self._inference_enabled
+                    or self._active or self._shutting_down or self._stopped):
+                return None
+            status = self.snapshot()
+            if not status.camera.fresh or not status.cli_connected:
+                return None
+            frame = self._frame
+            identity = (self._epoch, frame.sequence)
+            if identity == self._last_input:
+                return None
+            self._last_input = identity
+            self._request_id += 1
+            self._active = True
+            return InferenceRequest(self._request_id, self._epoch,
+                                    ReceivedFrame(frame.sequence, frame.received_at, frame.image.copy()))
+
+    def complete_inference(self, request: InferenceRequest, duration: float, publish: Callable[[], None]) -> bool:
+        # Serialize the final acceptance/publication with stop commands. A stopped
+        # request can never publish later just because a new start was received.
+        with self._lock:
+            self._active = False
+            self._last_duration = duration
+            self._last_inference_frame = request.frame.sequence
+            status = self.snapshot()
+            age = self.clock() - request.frame.received_at
+            if (self._shutting_down or self._stopped or not self._inference_enabled
+                    or request.epoch != self._epoch or not status.camera.fresh or not status.cli_connected
+                    or age > self.config.inference.max_frame_age_seconds):
+                self._discarded += 1
+                return False
+            publish()
+            self._completed += 1
+            return True
+
+    def fail_inference(self, error: Exception, request: InferenceRequest | None = None) -> None:
+        with self._lock:
+            self._active = False
+            if request is not None and request.epoch != self._epoch:
+                self._discarded += 1
+                return
+            self._inference_error = str(error)
+            self._inference_enabled = False
 
     def snapshot(self) -> NodeState:
         with self._lock:
@@ -93,8 +181,21 @@ class TransportState:
             go2_age = None if self._go2_at is None else max(0.0, now - self._go2_at)
             go2_fresh = go2_age is not None and go2_age <= self.config.go2.node_state_timeout_seconds
             go2 = self._go2 if go2_fresh else None
+            lifecycle = "idle"
+            if self.config.inference is not None:
+                lifecycle = ("error" if self._inference_error else "loading" if not self._model_loaded
+                             else "paused" if not self._inference_enabled else "running" if self._active else "idle")
+            if self._shutting_down:
+                lifecycle = "stopping"
+            if self._stopped:
+                lifecycle = "stopped"
+            extra = {} if self.config.inference is None else {
+                "stage": "inference",
+                "status_message": "Image-path inference only; no robot commands are published.",
+            }
             return NodeState(
-                lifecycle="stopped" if self._stopped else "idle",
+                **extra,
+                lifecycle=lifecycle,
                 cli_connected=(self._heartbeat_at is not None and
                                now - self._heartbeat_at <= self.config.cli_heartbeat_timeout_seconds),
                 received_commands=self._command_count,
@@ -112,6 +213,12 @@ class TransportState:
                     accepting_commands=go2.accepting_commands if go2 else False,
                     robot_state=go2.robot_state if go2 else None,
                 ),
+                inference=InferenceState(
+                    model_loaded=self._model_loaded, enabled=self._inference_enabled,
+                    active=self._active, device=self._device, completed=self._completed,
+                    discarded=self._discarded, last_frame_sequence=self._last_inference_frame,
+                    last_duration_seconds=self._last_duration, last_error=self._inference_error,
+                ),
             )
 
 
@@ -120,10 +227,59 @@ def has_encoding(sample, expected: str) -> bool:
 
 
 class NodeRuntime:
-    def __init__(self, config: NodeConfig, *, clock: Callable[[], float] = time.monotonic):
+    def __init__(self, config: NodeConfig, *, clock: Callable[[], float] = time.monotonic, engine_loader=None):
         self.config = config
         self.state = TransportState(config, clock)
         self._decode_lock = Lock()
+        self._engine_loader = engine_loader
+
+    def _run_inference(self, stop: Event, paths_publisher, preview_publisher) -> None:
+        from inference import VAMOSEngine, render_preview
+
+        config = self.config.inference
+        try:
+            engine = (self._engine_loader or VAMOSEngine.load)(config)
+            self.state.model_loaded(engine.device)
+            LOGGER.info("VAMOS ready on %s; waiting for fresh image and heartbeat", engine.device)
+        except Exception as error:
+            self.state.fail_inference(error)
+            LOGGER.exception("VAMOS model loading failed")
+            return
+        period = 1.0 / config.frequency_hz
+        deadline = time.monotonic()
+        while not stop.is_set():
+            request = self.state.begin_inference()
+            if request is not None:
+                started = time.perf_counter()
+                try:
+                    output = engine.infer(request.frame.image)
+                    duration = time.perf_counter() - started
+                    result = TrajectoryResult(
+                        inference_id=request.inference_id, frame_sequence=request.frame.sequence,
+                        image_width=request.frame.image.width, image_height=request.frame.image.height,
+                        goal_pixels=config.goal.pixels(request.frame.image.width, request.frame.image.height),
+                        prompt=output.prompt, trajectories=output.trajectories,
+                        generated_texts=output.generated_texts, device=output.device,
+                        duration_seconds=duration,
+                        source_age_seconds=max(0.0, self.state.clock() - request.frame.received_at),
+                    )
+                    preview = render_preview(request.frame.image, result)
+
+                    def publish():
+                        preview_publisher.put(preview, attachment=str(result.inference_id).encode("ascii"))
+                        paths_publisher.put(result.model_dump_json())
+
+                    if self.state.complete_inference(request, duration, publish):
+                        LOGGER.info("Published inference=%d frame=%d paths=%d %.3fs %s",
+                                    result.inference_id, result.frame_sequence, len(result.trajectories), duration, output.device)
+                    else:
+                        LOGGER.info("Discarded inference=%d after stop, stale input, or shutdown", result.inference_id)
+                except Exception as error:
+                    self.state.fail_inference(error, request)
+                    LOGGER.exception("VAMOS inference failed; paused until start or restart")
+            now = time.monotonic()
+            deadline += (max(0, math.floor((now - deadline) / period)) + 1) * period
+            stop.wait(max(0.0, deadline - time.monotonic()))
 
     def _on_camera(self, sample) -> None:
         if not has_encoding(sample, JPEG_ENCODING):
@@ -174,6 +330,22 @@ class NodeRuntime:
             resources.enter_context(session.declare_subscriber(keys["go2_state"], self._on_go2_state))
             resources.enter_context(session.declare_subscriber(keys["command"], self._on_control))
             LOGGER.info("Transport ready: camera=%s Go2=%s state=%s", keys["camera"], keys["go2_state"], keys["state"])
+            inference_stop = Event()
+            worker = None
+            if self.config.inference is not None:
+                paths = resources.enter_context(session.declare_publisher(
+                    keys["trajectories"], encoding=JSON_ENCODING,
+                    congestion_control=zenoh.CongestionControl.DROP,
+                    reliability=zenoh.Reliability.BEST_EFFORT,
+                ))
+                preview = resources.enter_context(session.declare_publisher(
+                    keys["preview"], encoding=JPEG_ENCODING,
+                    congestion_control=zenoh.CongestionControl.DROP,
+                    reliability=zenoh.Reliability.BEST_EFFORT,
+                ))
+                worker = Thread(target=self._run_inference, args=(inference_stop, paths, preview),
+                                name="vamos-inference", daemon=True)
+                worker.start()
             period = 1.0 / self.config.node_state_publish_frequency_hz
             deadline = time.monotonic()
             try:
@@ -183,6 +355,12 @@ class NodeRuntime:
                     deadline += (max(0, math.floor((now - deadline) / period)) + 1) * period
                     stop.wait(max(0.0, deadline - time.monotonic()))
             finally:
+                self.state.request_shutdown()
+                inference_stop.set()
+                if worker is not None:
+                    worker.join(self.config.inference.shutdown_timeout_seconds)
+                    if worker.is_alive():
+                        raise RuntimeError("VAMOS inference did not finish before the shutdown timeout")
                 self.state.mark_stopped()
                 publisher.put(self.state.snapshot().model_dump_json())
 
@@ -211,7 +389,7 @@ def main() -> int:
         config = load_node_config(args.node_config)
         with stop_on_signals() as stop:
             NodeRuntime(config).run(zenoh.Config.from_file(str(args.zenoh_config)), stop)
-    except (OSError, ValueError, zenoh.ZError) as error:
+    except (OSError, ValueError, RuntimeError, zenoh.ZError) as error:
         LOGGER.error("%s", error)
         return 1
     return 0

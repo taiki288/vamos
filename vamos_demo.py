@@ -14,7 +14,7 @@ from transformers import AutoProcessor, AutoModelForVision2Seq
 from peft import PeftConfig, PeftModel
 
 
-def load_vamos_model(model_name_or_path, use_fp32=False, trust_remote_code=True):
+def load_vamos_model(model_name_or_path, use_fp32=False, trust_remote_code=True, device=None):
     """
     Load the VAMOS model and processor from Hugging Face.
     
@@ -22,13 +22,14 @@ def load_vamos_model(model_name_or_path, use_fp32=False, trust_remote_code=True)
         model_name_or_path: Hugging Face model name or local path
         use_fp32: Use FP32 precision instead of bfloat16
         trust_remote_code: Trust remote code for model loading
+        device: Optional explicit "cuda" or "cpu"; defaults to automatic selection
     
     Returns:
         tuple: (model, processor, device) or (None, None, None) if failed
     """
     print(f"🔄 Loading VAMOS model from: {model_name_or_path}")
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥️  Using device: {device}")
     
     try:

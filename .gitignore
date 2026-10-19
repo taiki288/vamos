@@ -116,3 +116,4 @@ zenoh/node-config.json5
 zenoh/zenoh-config.json5
 zenoh/peer-zenoh-config.json5
 zenoh/diagnostic-peer-config.json5
+zenoh/inference-node-config.json5
