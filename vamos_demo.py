@@ -157,6 +157,10 @@ def generate_trajectories(model, processor, image, text_prompt, max_tokens=10, t
             "do_sample": (temperature > 0),
             "num_return_sequences": num_samples
         }
+
+        # Windows CUDA inference must not require Triton for auto-compilation.
+        if sys.platform == "win32" and str(device).startswith("cuda"):
+            generation_kwargs["disable_compile"] = True
         
         if temperature > 0:
             generation_kwargs["temperature"] = temperature
