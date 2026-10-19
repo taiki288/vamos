@@ -179,6 +179,23 @@ class NodeState(Settings):
 FinitePixel = Annotated[float, Field(allow_inf_nan=False)]
 
 
+class CapturePose(Settings):
+    x: FinitePixel = 0.0
+    y: FinitePixel = 0.0
+    yaw: FinitePixel = 0.0
+
+
+class CaptureContext(Settings):
+    # Demo-only pose annotation. Ordinary camera JPEGs need no attachment and
+    # still support image inference, but cannot drive the streaming simulator.
+    kind: Literal["static_image_demo"] = "static_image_demo"
+    source_id: Annotated[StrictStr, Field(min_length=1, max_length=128)]
+    frame_id: Annotated[int, Field(strict=True, ge=0)]
+    captured_at_unix_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    world_frame: Literal["static_demo_world"] = "static_demo_world"
+    pose: CapturePose = Field(default_factory=CapturePose)
+
+
 class TrajectoryResult(Settings):
     inference_id: int
     frame_sequence: int
@@ -192,6 +209,7 @@ class TrajectoryResult(Settings):
     duration_seconds: float
     source_age_seconds: float
     device: str
+    capture: CaptureContext | None = None
 
     @model_validator(mode="after")
     def valid_paths(self) -> TrajectoryResult:

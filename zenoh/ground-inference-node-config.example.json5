@@ -1,0 +1,22 @@
+{
+  zenoh_key_prefix: "vamos",
+  node_state_publish_frequency_hz: 10.0,
+  cli_heartbeat_timeout_seconds: 1.0,
+  camera: { key: "camera/front", frame_freshness_seconds: 2.5 },
+  go2: { zenoh_key_prefix: "unitree/go2", node_state_timeout_seconds: 0.5 },
+  inference: {
+    model_key: "mateoguaman/vamos",
+    device: "cuda",
+    num_samples: 10,
+    max_new_tokens: 10,
+    temperature: 0.05,
+    frequency_hz: 1.0,
+    max_frame_age_seconds: 5.0,
+    shutdown_timeout_seconds: 30.0,
+    goal: {
+      x: 0.5,
+      y: 0.6,
+      instruction: "Follow the open paved path toward the goal while avoiding people.",
+    },
+  },
+}

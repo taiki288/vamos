@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import signal
@@ -18,7 +19,7 @@ import zenoh
 from PIL import Image
 
 from config import (
-    CameraState, ControlCommand, Go2NodeState, Go2State, JPEG_ENCODING,
+    CameraState, CaptureContext, ControlCommand, Go2NodeState, Go2State, JPEG_ENCODING,
     JSON_ENCODING, InferenceState, NodeConfig, NodeState, TrajectoryResult, load_node_config,
 )
 
@@ -31,6 +32,7 @@ class ReceivedFrame:
     sequence: int
     received_at: float
     image: Image.Image
+    capture: CaptureContext | None = None
 
 
 @dataclass(frozen=True)
@@ -70,10 +72,10 @@ class TransportState:
         self._last_duration: float | None = None
         self._inference_error: str | None = None
 
-    def receive_frame(self, image: Image.Image, received_at: float) -> None:
+    def receive_frame(self, image: Image.Image, received_at: float, capture: CaptureContext | None = None) -> None:
         with self._lock:
             sequence = 1 if self._frame is None else self._frame.sequence + 1
-            self._frame = ReceivedFrame(sequence, received_at, image)
+            self._frame = ReceivedFrame(sequence, received_at, image, capture)
 
     def latest_frame(self) -> ReceivedFrame | None:
         """Return an owned copy only while the latest image is still fresh."""
@@ -81,7 +83,7 @@ class TransportState:
             frame = self._frame
             if frame is None or self.clock() - frame.received_at > self.config.camera.frame_freshness_seconds:
                 return None
-            return ReceivedFrame(frame.sequence, frame.received_at, frame.image.copy())
+            return ReceivedFrame(frame.sequence, frame.received_at, frame.image.copy(), frame.capture)
 
     def receive_go2(self, state: Go2NodeState) -> None:
         with self._lock:
@@ -143,7 +145,7 @@ class TransportState:
             self._request_id += 1
             self._active = True
             return InferenceRequest(self._request_id, self._epoch,
-                                    ReceivedFrame(frame.sequence, frame.received_at, frame.image.copy()))
+                                    ReceivedFrame(frame.sequence, frame.received_at, frame.image.copy(), frame.capture))
 
     def complete_inference(self, request: InferenceRequest, duration: float, publish: Callable[[], None]) -> bool:
         # Serialize the final acceptance/publication with stop commands. A stopped
@@ -262,6 +264,7 @@ class NodeRuntime:
                         generated_texts=output.generated_texts, device=output.device,
                         duration_seconds=duration,
                         source_age_seconds=max(0.0, self.state.clock() - request.frame.received_at),
+                        capture=request.frame.capture,
                     )
                     preview = render_preview(request.frame.image, result)
 
@@ -289,11 +292,22 @@ class NodeRuntime:
             return  # Skip overlapping frames rather than building a backlog.
         received_at = self.state.clock()
         try:
+            attachment = getattr(sample, "attachment", None)
+            capture = None
+            if attachment is not None:
+                try:
+                    metadata = json.loads(attachment.to_bytes())
+                except (ValueError, UnicodeDecodeError):
+                    metadata = None
+                # Attachments from independently versioned camera nodes may use
+                # other formats. Only this explicitly tagged demo schema is ours.
+                if isinstance(metadata, dict) and metadata.get("kind") == "static_image_demo":
+                    capture = CaptureContext.model_validate(metadata)
             with Image.open(BytesIO(sample.payload.to_bytes())) as source:
                 if source.format != "JPEG":
                     raise ValueError("camera payload is not a JPEG")
                 image = source.convert("RGB")
-            self.state.receive_frame(image, received_at)
+            self.state.receive_frame(image, received_at, capture)
         except (OSError, ValueError, Image.DecompressionBombError) as error:
             self.state.reject("camera")
             LOGGER.warning("Rejected camera image: %s", error)

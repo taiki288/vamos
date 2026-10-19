@@ -1,0 +1,17 @@
+{
+  "image_width": 1280,
+  "image_height": 720,
+  "fx": 640.0,
+  "fy": 640.0,
+  "cx": 640.0,
+  "cy": 360.0,
+  "height_m": 0.5,
+  "pitch_down_degrees": 10.0,
+  "yaw_left_degrees": 0.0,
+  "forward_offset_m": 0.15,
+  "left_offset_m": 0.0,
+  "max_distance_m": 8.0,
+  "max_segment_length_m": 3.0,
+  "calibration_status": "assumed",
+  "notes": "Illustrative pinhole intrinsics and mounting, NOT measured for the sample images or Go2. Assumes a rectified image, zero camera roll, and flat ground."
+}

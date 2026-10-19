@@ -6,6 +6,7 @@ import argparse
 import logging
 import math
 import time
+from uuid import uuid4
 from contextlib import ExitStack
 from io import BytesIO
 from pathlib import Path
@@ -16,7 +17,7 @@ import zenoh
 from PIL import Image
 from pydantic import StrictStr, field_validator
 
-from config import JPEG_ENCODING, JSON_ENCODING, NodeState, PositiveSeconds, Settings, TrajectoryResult, load_node_config
+from config import CaptureContext, JPEG_ENCODING, JSON_ENCODING, NodeState, PositiveSeconds, Settings, TrajectoryResult, load_node_config
 from node import HERE, stop_on_signals
 
 
@@ -37,12 +38,14 @@ def main() -> int:
     parser.add_argument("--node-config", type=Path, default=HERE / "node-config.example.json5")
     parser.add_argument("--peer-config", type=Path, default=HERE / "diagnostic-peer-config.example.json5")
     parser.add_argument("--zenoh-config", type=Path, default=HERE / "peer-zenoh-config.example.json5")
+    parser.add_argument("--image", type=Path, help="Override the fixture image (relative to working directory)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     try:
         config = load_node_config(args.node_config)
         peer = PeerConfig.model_validate(json5.loads(args.peer_config.read_text(encoding="utf-8"), allow_duplicate_keys=False))
-        image_path = (args.peer_config.resolve().parent / peer.image_path).resolve()
+        image_path = (args.image.resolve() if args.image else
+                      (args.peer_config.resolve().parent / peer.image_path).resolve())
         with Image.open(image_path) as source:
             buffer = BytesIO()
             source.convert("RGB").save(buffer, format="JPEG", quality=90)
@@ -85,10 +88,14 @@ def main() -> int:
             control = resources.enter_context(session.declare_publisher(keys["command"], encoding=JSON_ENCODING))
             logging.info("Sending %s + SIMULATED Go2 state + heartbeat. Ctrl+C to stop.", image_path.name)
             next_report = 0.0
+            source_id, frame_id = str(uuid4()), 0
             period = 1.0 / peer.publish_frequency_hz
             deadline = time.monotonic()
             while not stop.is_set():
-                camera.put(jpeg)
+                frame_id += 1
+                capture = CaptureContext(source_id=source_id, frame_id=frame_id,
+                                         captured_at_unix_seconds=time.time())
+                camera.put(jpeg, attachment=capture.model_dump_json().encode("utf-8"))
                 go2.put(fake_go2)
                 control.put('{"type":"heartbeat"}')
                 now = time.monotonic()
