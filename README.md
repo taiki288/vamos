@@ -38,8 +38,34 @@ Run commands through the uv environment:
    uv run jupyter notebook vamos_demo.ipynb
    ```
 
+The base install contains only what VAMOS inference and the Zenoh nodes need.
+Optional groups add the rest:
+
+| Group | Adds | Used by |
+| --- | --- | --- |
+| `zenoh` | `eclipse-zenoh`, `json5` | everything under `zenoh/` |
+| `dev` | Jupyter | `vamos_demo.ipynb` |
+| `server` | FastAPI, Uvicorn | `server/vlm_server.py` |
+| `ros` | catkin tools, ONNX Runtime, optimum, local `trajectory_*` packages | `vamos_ws` ROS nodes |
+
 The local `trajectory_prediction` and `trajectory_projection` packages are
-installed as editable path dependencies by uv.
+installed as editable path dependencies by `uv sync --group ros`.
+
+### Jetson AGX Orin
+
+The lock file selects platform-specific Torch builds: Windows AMD64 uses the
+CUDA 12.8 index, Linux aarch64 (Jetson AGX Orin, JetPack 7.2 / L4T r39.2) uses
+the CUDA 13.2 index, and other Linux hosts use PyPI. On the Jetson:
+
+   ```bash
+   uv sync --group zenoh
+   uv run python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_capability())"
+   ```
+
+The second command should print `True (8, 7)`. VAMOS loads in bfloat16, which
+Orin (Ampere) supports. Model loading and inference latency on the Jetson have
+not been measured yet; see [zenoh/README.md](zenoh/README.md) for the
+deployment checklist.
 
 ### Conda Alternative
 
