@@ -112,10 +112,7 @@ config/*_local.yaml
 .rosinstall_previous
 
 # Local Zenoh runtime settings (keep the example files tracked)
-zenoh/node-config.json5
-zenoh/zenoh-config.json5
-zenoh/peer-zenoh-config.json5
-zenoh/diagnostic-peer-config.json5
-zenoh/inference-node-config.json5
+zenoh/*.json5
+!zenoh/*.example.json5
 zenoh/ground-camera.json
 outputs/

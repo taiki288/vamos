@@ -184,9 +184,9 @@ class CliRuntime:
             update = self.cache.wait(lambda value: value.node_session_id != state.node_session_id or
                 (value.cycle.executor_fresh and value.cycle.executor_motion == "stopped"), self.command_timeout)
             if update is None:
-                raise TimeoutError("No stopped stop-go simulator confirmed; check processes and simulator state")
+                raise TimeoutError("No stopped stop-go executor confirmed; check the executor/simulator and Go2 state")
             if update.node_session_id != state.node_session_id:
-                raise RuntimeError("Node restarted while waiting for the simulator")
+                raise RuntimeError("Node restarted while waiting for the executor")
         update = self._request("start")
         self.output(f"Inference started (goal revision {update.goal_revision}).")
         return update
@@ -196,7 +196,7 @@ class CliRuntime:
         # a stale cached observation being mistaken for confirmation.
         update = self._request("stop")
         self.output("Stopped; pending inference finished" +
-                    (" and simulated motion confirmed stopped." if update.cycle.mode == "stop_go" else "."))
+                    (" and the executor confirmed stopped." if update.cycle.mode == "stop_go" else "."))
         return update
 
     def set_goal(self, goal: GoalConfig):
@@ -216,6 +216,9 @@ class CliRuntime:
                     f"enabled={inf.enabled} active={inf.active}")
         self.output(f"camera_fresh={state.camera.fresh} heartbeat={state.cli_connected} "
                     f"completed={inf.completed} discarded={inf.discarded} last_seconds={inf.last_duration_seconds}")
+        go2 = state.go2
+        self.output(f"start_ready={state.start_ready} go2_fresh={go2.fresh} go2_state="
+                    f"{go2.robot_state.state if go2.robot_state else None} accepting={go2.accepting_commands}")
         if state.goal:
             self.output(f"goal=({state.goal.x:g}, {state.goal.y:g}) revision={state.goal_revision} "
                         f"instruction={state.goal.instruction!r}")
