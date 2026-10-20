@@ -57,7 +57,27 @@ class GoalConfig(Settings):
         return min(width - 1.0, x * width / 1024), min(height - 1.0, y * height / 1024)
 
 
+class StopGoConfig(Settings):
+    inference_timeout_seconds: PositiveSeconds = 60.0
+    max_step_seconds: PositiveSeconds = 1.0
+    max_step_distance_m: PositiveSeconds = 0.2
+    max_step_yaw_rad: PositiveSeconds = 0.35
+    stop_settle_seconds: PositiveSeconds = 0.2
+    executor_timeout_seconds: PositiveSeconds = 1.0
+    image_wait_timeout_seconds: PositiveSeconds = 5.0
+    movement_timeout_seconds: PositiveSeconds = 4.0
+
+    @model_validator(mode="after")
+    def timeouts(self):
+        if self.movement_timeout_seconds <= self.max_step_seconds + self.stop_settle_seconds:
+            raise ValueError("movement timeout must exceed step duration plus settling time")
+        return self
+
+
 class InferenceConfig(Settings):
+    execution_mode: Literal["continuous", "stop_go"] = "continuous"
+    stop_go: StopGoConfig = Field(default_factory=StopGoConfig)
+    auto_start: StrictBool = False
     model_key: Annotated[StrictStr, Field(min_length=1)] = "mateoguaman/vamos"
     device: Literal["auto", "cuda", "cpu"] = "cuda"
     num_samples: Annotated[int, Field(strict=True, ge=1, le=50)] = 10
@@ -71,6 +91,8 @@ class InferenceConfig(Settings):
 
     @model_validator(mode="after")
     def generation_settings(self) -> InferenceConfig:
+        if self.execution_mode == "stop_go" and self.auto_start:
+            raise ValueError("stop-go cycles require an explicit operator start")
         if self.temperature == 0 and self.num_samples != 1:
             raise ValueError("greedy decoding requires num_samples=1")
         if self.max_new_tokens % 2:
@@ -113,6 +135,7 @@ class NodeConfig(Settings):
             "preview": f"{self.zenoh_key_prefix}/preview",
             "go2_state": f"{self.go2.zenoh_key_prefix}/state",
             "go2_command": f"{self.go2.zenoh_key_prefix}/command",
+            "executor_state": f"{self.zenoh_key_prefix}/executor/state",
         }
 
 
@@ -131,7 +154,29 @@ class Go2NodeState(BaseModel):
 
 
 class ControlCommand(Settings):
-    type: Literal["heartbeat", "start", "stop"]
+    type: Literal["heartbeat", "start", "stop", "goal"]
+    request_id: Annotated[StrictStr, Field(min_length=1, max_length=64)] | None = None
+    node_session_id: Annotated[StrictStr, Field(min_length=1, max_length=64)] | None = None
+    expected_goal_revision: Annotated[int, Field(strict=True, ge=0)] | None = None
+    goal: GoalConfig | None = None
+
+    @model_validator(mode="after")
+    def command_fields(self):
+        if (self.type == "goal") != (self.goal is not None):
+            raise ValueError("only a goal command must contain a complete goal")
+        if self.type == "heartbeat" and any(v is not None for v in
+                (self.request_id, self.node_session_id, self.expected_goal_revision)):
+            raise ValueError("heartbeat must not contain control metadata")
+        if self.type == "stop" and self.expected_goal_revision is not None:
+            raise ValueError("stop must not depend on a goal revision")
+        return self
+
+
+class ControlAck(Settings):
+    request_id: str
+    type: Literal["start", "stop", "goal"]
+    accepted: bool
+    message: str
 
 
 class CameraState(Settings):
@@ -163,7 +208,24 @@ class InferenceState(Settings):
     last_error: str | None = None
 
 
+class CycleState(Settings):
+    mode: Literal["continuous", "stop_go"] = "continuous"
+    phase: Literal["paused", "waiting_stop", "waiting_image", "inferencing", "moving"] = "paused"
+    cycle_id: int = 0
+    completed: int = 0
+    inference_id: int | None = None
+    executor_fresh: bool = False
+    executor_motion: Literal["stopped", "moving", "settling", "error"] | None = None
+    capture_after_unix_seconds: float | None = None
+
+
 class NodeState(Settings):
+    cycle: CycleState = Field(default_factory=CycleState)
+    node_session_id: str = ""
+    control_epoch: int = 0
+    goal_revision: int = 0
+    goal: GoalConfig | None = None
+    last_control_ack: ControlAck | None = None
     stage: Literal["transport", "inference"] = "transport"
     lifecycle: Literal["loading", "idle", "running", "paused", "error", "stopping", "stopped"]
     start_ready: Literal[False] = False
@@ -186,6 +248,19 @@ class CapturePose(Settings):
     yaw: FinitePixel = 0.0
 
 
+class ExecutorState(Settings):
+    # Feedback from the local ideal 2D executor, never a Go2 hardware claim.
+    kind: Literal["stop_go_simulator"] = "stop_go_simulator"
+    executor_session_id: Annotated[StrictStr, Field(min_length=1, max_length=64)]
+    node_session_id: Annotated[StrictStr, Field(min_length=1, max_length=64)]
+    control_epoch: Annotated[int, Field(strict=True, ge=0)]
+    cycle_id: Annotated[int, Field(strict=True, ge=0)]
+    motion: Literal["stopped", "moving", "settling", "error"]
+    inference_id: int | None = None
+    pose: CapturePose
+    message: str = ""
+
+
 class CaptureContext(Settings):
     # Demo-only pose annotation. Ordinary camera JPEGs need no attachment and
     # still support image inference, but cannot drive the streaming simulator.
@@ -198,6 +273,11 @@ class CaptureContext(Settings):
 
 
 class TrajectoryResult(Settings):
+    generated_at_unix_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = None
+    cycle_id: int | None = None
+    node_session_id: str | None = None
+    control_epoch: int | None = None
+    goal_revision: int | None = None
     inference_id: int
     frame_sequence: int
     image_width: Annotated[int, Field(gt=0)]

@@ -39,6 +39,7 @@ def main() -> int:
     parser.add_argument("--peer-config", type=Path, default=HERE / "diagnostic-peer-config.example.json5")
     parser.add_argument("--zenoh-config", type=Path, default=HERE / "peer-zenoh-config.example.json5")
     parser.add_argument("--image", type=Path, help="Override the fixture image (relative to working directory)")
+    parser.add_argument("--no-heartbeat", action="store_true", help="Let the operator CLI own heartbeat liveness")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     try:
@@ -86,7 +87,8 @@ def main() -> int:
             camera = resources.enter_context(session.declare_publisher(keys["camera"], encoding=JPEG_ENCODING))
             go2 = resources.enter_context(session.declare_publisher(keys["go2_state"], encoding=JSON_ENCODING))
             control = resources.enter_context(session.declare_publisher(keys["command"], encoding=JSON_ENCODING))
-            logging.info("Sending %s + SIMULATED Go2 state + heartbeat. Ctrl+C to stop.", image_path.name)
+            logging.info("Sending %s + SIMULATED Go2 state%s. Ctrl+C to stop.", image_path.name,
+                         " (heartbeat supplied by CLI)" if args.no_heartbeat else " + heartbeat")
             next_report = 0.0
             source_id, frame_id = str(uuid4()), 0
             period = 1.0 / peer.publish_frequency_hz
@@ -97,7 +99,8 @@ def main() -> int:
                                          captured_at_unix_seconds=time.time())
                 camera.put(jpeg, attachment=capture.model_dump_json().encode("utf-8"))
                 go2.put(fake_go2)
-                control.put('{"type":"heartbeat"}')
+                if not args.no_heartbeat:
+                    control.put('{"type":"heartbeat"}')
                 now = time.monotonic()
                 if now >= next_report:
                     with lock:

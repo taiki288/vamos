@@ -24,7 +24,7 @@ from node import NodeRuntime, TransportState
 from test_transport import BASE_CONFIG, image_bytes, wait_for_listener
 
 
-INFERENCE = {"goal": {"x": 0.434, "y": 0.514}, "device": "cpu", "frequency_hz": 20.0}
+INFERENCE = {"goal": {"x": 0.434, "y": 0.514}, "device": "cpu", "frequency_hz": 20.0, "auto_start": True}
 
 
 class InferenceTests(unittest.TestCase):
@@ -67,9 +67,9 @@ class InferenceTests(unittest.TestCase):
         self.state.receive_command(ControlCommand(type="stop"))
         self.state.receive_command(ControlCommand(type="heartbeat"))
         self.assertFalse(self.state.snapshot().inference.enabled)
-        self.state.receive_command(ControlCommand(type="start"))
         publish = Mock()
         self.assertFalse(self.state.complete_inference(request, 0.1, publish))
+        self.state.receive_command(ControlCommand(type="start"))
         publish.assert_not_called()
         self.assertEqual(self.state.snapshot().inference.discarded, 1)
         self.assertIsNotNone(self.state.begin_inference())
@@ -140,7 +140,7 @@ class InferenceNetworkTests(unittest.TestCase):
         class FakeEngine:
             device = "cpu"
 
-            def infer(self, image):
+            def infer(self, image, goal=None):
                 infer_started.set()
                 if not infer_release.wait(5):
                     raise RuntimeError("Test inference was not released")

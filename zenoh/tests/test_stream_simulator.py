@@ -28,7 +28,7 @@ from test_transport import BASE_CONFIG, image_bytes, sample, wait_for_listener
 
 CAMERA = GroundCamera(64, 48, 32, 32, 32, 24, 0.5)
 CONFIG = {**BASE_CONFIG, "inference": {"goal": {"x": 0.5, "y": 0.65},
-                                     "device": "cpu", "frequency_hz": 20.0}}
+                                     "device": "cpu", "frequency_hz": 20.0, "auto_start": True}}
 
 
 class StreamFollowerTests(unittest.TestCase):
@@ -54,6 +54,9 @@ class StreamFollowerTests(unittest.TestCase):
                     goal_pixels=(32, 32), prompt="test", trajectories=[[(32, 44), (32, 36), (32, 32)]],
                     generated_texts=["test"], duration_seconds=0.1, source_age_seconds=0.1,
                     device="cpu", capture=context)
+        state = self.transport.snapshot()
+        data.update(node_session_id=state.node_session_id, control_epoch=state.control_epoch,
+                    goal_revision=state.goal_revision)
         return TrajectoryResult(**{**data, **changes})
 
     def test_updates_stay_anchored_to_capture_pose_while_robot_moves(self):
@@ -198,7 +201,7 @@ class StreamNetworkTests(unittest.TestCase):
         class Engine:
             device = "cpu"
 
-            def infer(self, image):
+            def infer(self, image, goal=None):
                 return InferenceOutput([[(32, 44), (32, 36), (32, 32)]], ["test"], "test", "cpu")
 
         node = NodeRuntime(config, engine_loader=lambda _: Engine())

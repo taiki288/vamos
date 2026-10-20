@@ -10,7 +10,7 @@ import sys
 
 from PIL import Image, ImageDraw
 
-from config import InferenceConfig, TrajectoryResult
+from config import GoalConfig, InferenceConfig, TrajectoryResult
 
 
 @dataclass(frozen=True)
@@ -21,10 +21,11 @@ class InferenceOutput:
     device: str
 
 
-def build_prompt(config: InferenceConfig) -> str:
-    x, y = config.goal.tokens()
+def build_prompt(config: InferenceConfig, goal: GoalConfig | None = None) -> str:
+    goal = goal or config.goal
+    x, y = goal.tokens()
     prompt = f"Navigate to x=<loc{x:04d}>, y=<loc{y:04d}>."
-    instruction = config.goal.instruction.strip()
+    instruction = goal.instruction.strip()
     return f"{prompt} {instruction}" if instruction else prompt
 
 
@@ -54,10 +55,10 @@ class VAMOSEngine:
         model.eval()
         return cls(model, processor, actual_device, generate_trajectories, config)
 
-    def infer(self, image: Image.Image) -> InferenceOutput:
+    def infer(self, image: Image.Image, goal: GoalConfig | None = None) -> InferenceOutput:
         import torch
 
-        prompt = build_prompt(self.config)
+        prompt = build_prompt(self.config, goal)
         paths, texts, error = self.generate(
             self.model, self.processor, image, prompt,
             max_tokens=self.config.max_new_tokens,

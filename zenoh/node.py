@@ -6,20 +6,23 @@ import argparse
 import json
 import logging
 import math
+import os
 import signal
 import time
 from contextlib import ExitStack, contextmanager
+from collections import OrderedDict
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
 from typing import Callable
+from uuid import uuid4
 
 import zenoh
 from PIL import Image
 
 from config import (
-    CameraState, CaptureContext, ControlCommand, Go2NodeState, Go2State, JPEG_ENCODING,
+    CameraState, CaptureContext, ControlAck, ControlCommand, CycleState, ExecutorState, GoalConfig, Go2NodeState, Go2State, JPEG_ENCODING,
     JSON_ENCODING, InferenceState, NodeConfig, NodeState, TrajectoryResult, load_node_config,
 )
 
@@ -40,14 +43,18 @@ class InferenceRequest:
     inference_id: int
     epoch: int
     frame: ReceivedFrame
+    goal: GoalConfig
+    goal_revision: int
+    cycle_id: int | None = None
 
 
 class TransportState:
     """A bounded latest-observation store shared by Zenoh callbacks."""
 
-    def __init__(self, config: NodeConfig, clock: Callable[[], float] = time.monotonic):
+    def __init__(self, config: NodeConfig, clock: Callable[[], float] = time.monotonic, wall_clock=time.time):
         self.config = config
         self.clock = clock
+        self.wall_clock = wall_clock
         self._lock = RLock()
         self._frame: ReceivedFrame | None = None
         self._go2: Go2NodeState | None = None
@@ -57,9 +64,18 @@ class TransportState:
         self._command_count = 0
         self._last_command: str | None = None
         self._rejected = {"camera": 0, "go2": 0, "command": 0}
+        if self.stop_go:
+            self._rejected["executor"] = 0
         self._stopped = False
         self._shutting_down = False
-        self._inference_enabled = config.inference is not None
+        self._inference_enabled = bool(config.inference and config.inference.auto_start)
+        self._session_id = str(uuid4())
+        self._goal = config.inference.goal if config.inference else None
+        self._goal_revision = 0
+        self._last_ack = None
+        self._acks = OrderedDict()
+        self._inputs_seen = False
+        self._pause_reason = None
         self._model_loaded = False
         self._device: str | None = None
         self._active = False
@@ -71,6 +87,64 @@ class TransportState:
         self._last_inference_frame: int | None = None
         self._last_duration: float | None = None
         self._inference_error: str | None = None
+        self._cycle_phase = "paused"
+        self._cycle_id = self._cycle_completed = 0
+        self._cycle_inference_id = None
+        self._cycle_at = clock()
+        self._capture_after = None
+        self._min_cycle_frame = 0
+        self._executor = None
+        self._executor_at = None
+        self._observation_pose = None
+
+    @property
+    def stop_go(self):
+        return bool(self.config.inference and self.config.inference.execution_mode == "stop_go")
+
+    def _set_cycle_phase(self, phase):
+        self._cycle_phase, self._cycle_at = phase, self.clock()
+
+    def _pause(self, reason):
+        self._inference_enabled = False
+        self._epoch += 1
+        self._pause_reason = reason
+        self._set_cycle_phase("paused")
+
+    def _executor_fresh(self, now):
+        state = self._executor
+        return bool(self.stop_go and state is not None and self._executor_at is not None
+                    and now - self._executor_at <= self.config.inference.stop_go.executor_timeout_seconds
+                    and state.node_session_id == self._session_id and state.control_epoch == self._epoch
+                    and state.cycle_id == self._cycle_id)
+
+    def receive_executor(self, state: ExecutorState):
+        with self._lock:
+            if (not self.stop_go or state.node_session_id != self._session_id
+                    or state.control_epoch != self._epoch or state.cycle_id != self._cycle_id):
+                return
+            if (self._inference_enabled and self._executor is not None
+                    and self._executor.executor_session_id != state.executor_session_id):
+                self._pause("Executor changed during a cycle; start required.")
+                return
+            self._executor, self._executor_at = state, self.clock()
+            if not self._inference_enabled:
+                return
+            if state.motion == "error":
+                self._pause(f"Executor stopped the cycle: {state.message}")
+            elif self._cycle_phase in ("waiting_image", "inferencing") and (
+                    state.motion != "stopped" or state.pose != self._observation_pose):
+                self._pause("Executor moved during observation/inference; start required.")
+            elif self._cycle_phase == "waiting_stop" and state.motion == "stopped":
+                self._min_cycle_frame = 0 if self._frame is None else self._frame.sequence
+                self._capture_after = self.wall_clock()
+                self._observation_pose = state.pose
+                self._set_cycle_phase("waiting_image")
+            elif (self._cycle_phase == "moving" and state.motion == "stopped"
+                    and state.inference_id == self._cycle_inference_id):
+                self._cycle_completed += 1
+                self._cycle_id += 1
+                self._cycle_inference_id = None
+                self._set_cycle_phase("waiting_stop")
 
     def receive_frame(self, image: Image.Image, received_at: float, capture: CaptureContext | None = None) -> None:
         with self._lock:
@@ -93,20 +167,91 @@ class TransportState:
 
     def receive_command(self, command: ControlCommand) -> None:
         with self._lock:
-            if command.type == "start":
-                if self.config.inference is None or not self._model_loaded or self._shutting_down:
-                    raise ValueError("inference is not available; navigation start is not implemented")
-                if not self._inference_enabled:
-                    self._epoch += 1
-                self._inference_enabled = True
-                self._inference_error = None
-            elif command.type == "stop":
-                self._inference_enabled = False
-                self._epoch += 1
+            payload = command.model_dump_json()
+            if command.request_id in self._acks:
+                previous_payload, ack = self._acks[command.request_id]
+                if previous_payload == payload:
+                    self._last_ack = ack
+                    return  # Reliable delivery/retry cannot execute the action twice.
+                self._last_ack = ControlAck(request_id=command.request_id, type=command.type,
+                                            accepted=False, message="request ID reused with different content")
+                raise ValueError(self._last_ack.message)
+            try:
+                self._apply_command(command)
+            except ValueError as error:
+                self._record_ack(command, payload, False, str(error))
+                raise
+            self._record_ack(command, payload, True, "accepted")
             self._command_count += 1
             self._last_command = command.type
-            if command.type == "heartbeat":
-                self._heartbeat_at = self.clock()
+
+    def _record_ack(self, command, payload, accepted, message):
+        if command.request_id is None:
+            return
+        ack = ControlAck(request_id=command.request_id, type=command.type, accepted=accepted, message=message)
+        self._last_ack = ack
+        self._acks[command.request_id] = (payload, ack)
+        if len(self._acks) > 64:
+            self._acks.popitem(last=False)
+
+    def _apply_command(self, command):
+        if command.type == "heartbeat":
+            self._heartbeat_at = self.clock()
+            return
+        if command.type == "stop":
+            self._pause("Stopped by operator; start required.")
+            return  # Stop remains unconditional, including loading/disconnection.
+        if command.node_session_id is not None and command.node_session_id != self._session_id:
+            raise ValueError("node restarted; refresh state before sending commands")
+        if self.config.inference is None or self._shutting_down or self._stopped:
+            raise ValueError("inference is unavailable")
+        if command.expected_goal_revision is not None and command.expected_goal_revision != self._goal_revision:
+            raise ValueError("goal changed; refresh state before sending commands")
+        if self._active:
+            raise ValueError("waiting for the previous inference to finish")
+        if command.type == "goal":
+            if self._inference_enabled:
+                raise ValueError("stop inference before changing the goal")
+            self._goal = command.goal
+            self._goal_revision += 1
+            self._epoch += 1
+            return
+        if not self._model_loaded:
+            raise ValueError("model is still loading")
+        status = self.snapshot()
+        if not status.camera.fresh or not status.cli_connected:
+            raise ValueError("start requires a fresh image and heartbeat")
+        if self.stop_go and (not status.cycle.executor_fresh or status.cycle.executor_motion != "stopped"):
+            raise ValueError("start requires a connected, stopped stop-go simulator")
+        if not self._inference_enabled:
+            self._epoch += 1
+        self._inference_enabled = True
+        self._inputs_seen = True
+        self._inference_error = None
+        self._pause_reason = None
+        if self.stop_go:
+            self._cycle_id += 1
+            self._cycle_inference_id = None
+            self._set_cycle_phase("waiting_stop")
+
+    def _expire_inputs(self, now):
+        if self._inference_enabled and self._inputs_seen:
+            camera_stale = self._frame is None or now - self._frame.received_at > self.config.camera.frame_freshness_seconds
+            cli_stale = self._heartbeat_at is None or now - self._heartbeat_at > self.config.cli_heartbeat_timeout_seconds
+            if camera_stale or cli_stale:
+                self._pause("Image or heartbeat expired; start required after recovery.")
+            elif self.stop_go:
+                settings = self.config.inference.stop_go
+                if not self._executor_fresh(now):
+                    # Allow the new cycle/epoch to be echoed once after a transition.
+                    if now - self._cycle_at > settings.executor_timeout_seconds:
+                        self._pause("Executor feedback expired; start required after recovery.")
+                timeout = {"waiting_stop": settings.executor_timeout_seconds,
+                           "waiting_image": settings.image_wait_timeout_seconds,
+                           "inferencing": settings.inference_timeout_seconds,
+                           "moving": settings.movement_timeout_seconds}.get(self._cycle_phase)
+                if timeout is not None and now - self._cycle_at > timeout:
+                    self._pause(f"Cycle phase {self._cycle_phase} timed out after {timeout:g}s; start required.")
 
     def reject(self, stream: str) -> None:
         with self._lock:
@@ -115,14 +260,12 @@ class TransportState:
     def mark_stopped(self) -> None:
         with self._lock:
             self._stopped = True
-            self._inference_enabled = False
-            self._epoch += 1
+            self._pause("Node stopped.")
 
     def request_shutdown(self) -> None:
         with self._lock:
             self._shutting_down = True
-            self._inference_enabled = False
-            self._epoch += 1
+            self._pause("Node shutting down.")
 
     def model_loaded(self, device: str) -> None:
         with self._lock:
@@ -135,17 +278,29 @@ class TransportState:
                     or self._active or self._shutting_down or self._stopped):
                 return None
             status = self.snapshot()
-            if not status.camera.fresh or not status.cli_connected:
+            if not self._inference_enabled or not status.camera.fresh or not status.cli_connected:
                 return None
+            self._inputs_seen = True
             frame = self._frame
+            if self.stop_go:
+                if self._cycle_phase != "waiting_image" or not self._executor_fresh(self.clock()):
+                    return None
+                capture = frame.capture
+                if (frame.sequence <= self._min_cycle_frame or capture is None
+                        or capture.captured_at_unix_seconds <= self._capture_after
+                        or capture.captured_at_unix_seconds > self.wall_clock() + 0.25):
+                    return None
             identity = (self._epoch, frame.sequence)
             if identity == self._last_input:
                 return None
             self._last_input = identity
             self._request_id += 1
             self._active = True
+            if self.stop_go:
+                self._set_cycle_phase("inferencing")
             return InferenceRequest(self._request_id, self._epoch,
-                                    ReceivedFrame(frame.sequence, frame.received_at, frame.image.copy(), frame.capture))
+                                    ReceivedFrame(frame.sequence, frame.received_at, frame.image.copy(), frame.capture),
+                                    self._goal, self._goal_revision, self._cycle_id if self.stop_go else None)
 
     def complete_inference(self, request: InferenceRequest, duration: float, publish: Callable[[], None]) -> bool:
         # Serialize the final acceptance/publication with stop commands. A stopped
@@ -156,13 +311,22 @@ class TransportState:
             self._last_inference_frame = request.frame.sequence
             status = self.snapshot()
             age = self.clock() - request.frame.received_at
+            # This longer budget applies only to the stopped static-image demo.
+            # Continuous operation retains its original source-age limit.
+            age_limit = (self.config.inference.stop_go.inference_timeout_seconds if self.stop_go
+                         else self.config.inference.max_frame_age_seconds)
             if (self._shutting_down or self._stopped or not self._inference_enabled
                     or request.epoch != self._epoch or not status.camera.fresh or not status.cli_connected
-                    or age > self.config.inference.max_frame_age_seconds):
+                    or age > age_limit):
                 self._discarded += 1
+                if self.stop_go and self._inference_enabled:
+                    self._pause("Inference result expired; start required.")
                 return False
             publish()
             self._completed += 1
+            if self.stop_go:
+                self._cycle_inference_id = request.inference_id
+                self._set_cycle_phase("moving")
             return True
 
     def fail_inference(self, error: Exception, request: InferenceRequest | None = None) -> None:
@@ -172,11 +336,12 @@ class TransportState:
                 self._discarded += 1
                 return
             self._inference_error = str(error)
-            self._inference_enabled = False
+            self._pause("Inference failed; start required.")
 
     def snapshot(self) -> NodeState:
         with self._lock:
             now = self.clock()
+            self._expire_inputs(now)
             frame = self._frame
             camera_age = None if frame is None else max(0.0, now - frame.received_at)
             camera_fresh = camera_age is not None and camera_age <= self.config.camera.frame_freshness_seconds
@@ -193,10 +358,17 @@ class TransportState:
                 lifecycle = "stopped"
             extra = {} if self.config.inference is None else {
                 "stage": "inference",
-                "status_message": "Image-path inference only; no robot commands are published.",
+                "status_message": self._pause_reason or "Image-path inference only; no robot commands are published.",
             }
             return NodeState(
                 **extra,
+                cycle=CycleState(mode="stop_go" if self.stop_go else "continuous", phase=self._cycle_phase,
+                    cycle_id=self._cycle_id, completed=self._cycle_completed, inference_id=self._cycle_inference_id,
+                    executor_fresh=self._executor_fresh(now),
+                    executor_motion=self._executor.motion if self._executor_fresh(now) else None,
+                    capture_after_unix_seconds=self._capture_after),
+                node_session_id=self._session_id, control_epoch=self._epoch,
+                goal=self._goal, goal_revision=self._goal_revision, last_control_ack=self._last_ack,
                 lifecycle=lifecycle,
                 cli_connected=(self._heartbeat_at is not None and
                                now - self._heartbeat_at <= self.config.cli_heartbeat_timeout_seconds),
@@ -254,12 +426,16 @@ class NodeRuntime:
             if request is not None:
                 started = time.perf_counter()
                 try:
-                    output = engine.infer(request.frame.image)
+                    output = engine.infer(request.frame.image, goal=request.goal)
                     duration = time.perf_counter() - started
                     result = TrajectoryResult(
+                        generated_at_unix_seconds=self.state.wall_clock(),
+                        cycle_id=request.cycle_id,
                         inference_id=request.inference_id, frame_sequence=request.frame.sequence,
                         image_width=request.frame.image.width, image_height=request.frame.image.height,
-                        goal_pixels=config.goal.pixels(request.frame.image.width, request.frame.image.height),
+                        goal_pixels=request.goal.pixels(request.frame.image.width, request.frame.image.height),
+                        node_session_id=self.state.snapshot().node_session_id,
+                        control_epoch=request.epoch, goal_revision=request.goal_revision,
                         prompt=output.prompt, trajectories=output.trajectories,
                         generated_texts=output.generated_texts, device=output.device,
                         duration_seconds=duration,
@@ -333,6 +509,15 @@ class NodeRuntime:
             self.state.reject("command")
             LOGGER.warning("Rejected control command: %s", error)
 
+    def _on_executor(self, sample):
+        try:
+            if not has_encoding(sample, JSON_ENCODING):
+                raise ValueError("executor state must use application/json")
+            self.state.receive_executor(ExecutorState.model_validate_json(sample.payload.to_bytes()))
+        except ValueError as error:
+            self.state.reject("executor")
+            LOGGER.warning("Rejected executor feedback: %s", error)
+
     def run(self, zenoh_config: zenoh.Config, stop: Event) -> None:
         keys = self.config.keys()
         with zenoh.open(zenoh_config) as session, ExitStack() as resources:
@@ -344,6 +529,8 @@ class NodeRuntime:
             resources.enter_context(session.declare_subscriber(keys["camera"], self._on_camera))
             resources.enter_context(session.declare_subscriber(keys["go2_state"], self._on_go2_state))
             resources.enter_context(session.declare_subscriber(keys["command"], self._on_control))
+            if self.state.stop_go:
+                resources.enter_context(session.declare_subscriber(keys["executor_state"], self._on_executor))
             LOGGER.info("Transport ready: camera=%s Go2=%s state=%s", keys["camera"], keys["go2_state"], keys["state"])
             inference_stop = Event()
             worker = None
@@ -383,13 +570,29 @@ class NodeRuntime:
 @contextmanager
 def stop_on_signals():
     requested = Event()
+    watcher_done = Event()
+    watcher = None
     previous = {}
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous[signum] = signal.getsignal(signum)
             signal.signal(signum, lambda *_: requested.set())
+        managed_stop_file = os.environ.get("VAMOS_MANAGED_STOP_FILE")
+        if managed_stop_file:
+            def watch_stop_file():
+                while not watcher_done.is_set():
+                    if Path(managed_stop_file).exists():
+                        requested.set()
+                        return
+                    watcher_done.wait(0.1)
+
+            watcher = Thread(target=watch_stop_file, name="vamos-managed-stop", daemon=True)
+            watcher.start()
         yield requested
     finally:
+        watcher_done.set()
+        if watcher is not None:
+            watcher.join(1)
         for signum, handler in previous.items():
             signal.signal(signum, handler)
 

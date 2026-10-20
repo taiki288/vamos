@@ -1,7 +1,7 @@
 """Receive live Zenoh paths and follow them in a planar static-image demo.
 
-Only local simulated motion is produced. No publisher or Go2 command connection
-exists in this process. Static-image capture poses must be explicitly annotated;
+Only local simulated motion is produced. Stop-go mode publishes executor feedback,
+never Go2 commands. Static-image capture poses must be explicitly annotated;
 unannotated camera streams cannot be used as odometry.
 """
 
@@ -61,6 +61,7 @@ class StreamFollower:
             self.capture = None
             self.result_at = None
             self.source_age_at_receipt = None
+            self.expiry_origin_unix_seconds = None
             self.source_id = None
             self.last_frame_id = -1
             self.cutoff_wall = self.wall_clock()
@@ -101,6 +102,12 @@ class StreamFollower:
     def receive_state(self, state: NodeState):
         with self.lock:
             previous = self.node_state
+            if previous is not None and state.node_session_id:
+                same_session = previous.node_session_id == state.node_session_id
+                if same_session and state.control_epoch < previous.control_epoch:
+                    return
+                if not same_session or state.control_epoch != previous.control_epoch:
+                    self._invalidate("control_changed")
             self.node_state, self.node_at = state, self.clock()
             if (not state.inference.enabled or state.lifecycle in ("error", "stopping", "stopped")):
                 if previous is not None and previous.inference.enabled:
@@ -113,6 +120,8 @@ class StreamFollower:
                 self.remote_stopped = control.type == "stop"
                 self.cutoff_wall = self.wall_clock()
                 self._invalidate("remote_stop" if self.remote_stopped else "waiting_for_result")
+            elif control.type == "goal":
+                self._invalidate("goal_changed")
 
     def toggle_pause(self):
         with self.lock:
@@ -126,6 +135,19 @@ class StreamFollower:
             if invalidate:
                 self._invalidate(reason)
 
+    def path_origin(self, capture):
+        return Pose2D(capture.pose.x, capture.pose.y, capture.pose.yaw)
+
+    def expiry_origin(self, result):
+        return result.capture.captured_at_unix_seconds
+
+    def result_age(self, result):
+        return max(self.wall_clock() - self.expiry_origin(result), result.source_age_seconds)
+
+    def path_age(self):
+        return max(self.wall_clock() - self.expiry_origin_unix_seconds,
+                   self.source_age_at_receipt + self.clock() - self.result_at)
+
     def receive_result(self, result: TrajectoryResult) -> bool:
         with self.lock:
             self.received += 1
@@ -133,6 +155,12 @@ class StreamFollower:
             if reason:
                 self.reject(reason)
                 return False
+            if self.node_state.node_session_id:
+                if (result.node_session_id != self.node_state.node_session_id
+                        or result.control_epoch != self.node_state.control_epoch
+                        or result.goal_revision != self.node_state.goal_revision):
+                    self.reject("obsolete_control_result", invalidate=False)
+                    return False
             capture = result.capture
             if capture is None:
                 self.reject("missing_capture_pose")
@@ -146,9 +174,10 @@ class StreamFollower:
             if capture.captured_at_unix_seconds <= self.cutoff_wall:
                 self.reject("before_start_or_reset", invalidate=False)
                 return False
-            age = self.wall_clock() - capture.captured_at_unix_seconds
-            if (age < -0.25 or age > self.path_timeout or not math.isfinite(result.source_age_seconds)
-                    or not 0 <= result.source_age_seconds <= self.path_timeout):
+            age = self.result_age(result)
+            if (self.wall_clock() - capture.captured_at_unix_seconds < -0.25
+                    or age < -0.25 or age > self.path_timeout or not math.isfinite(result.source_age_seconds)
+                    or result.source_age_seconds < 0):
                 self.reject("stale_or_future_result")
                 return False
             self.last_frame_id = capture.frame_id
@@ -160,7 +189,7 @@ class StreamFollower:
                 projected = self.projector.project_path(result.trajectories[self.candidate], self.candidate)
                 if not projected.usable:
                     raise ValueError(projected.stop_reason or "fewer than two distinct points")
-                pose = Pose2D(capture.pose.x, capture.pose.y, capture.pose.yaw)
+                pose = self.path_origin(capture)
                 path = path_to_world(projected.points_robot_m, pose)
             except ValueError as error:
                 self.reject("invalid_projection")
@@ -169,7 +198,8 @@ class StreamFollower:
             self.capture = capture
             self.path = path
             self.result_at = self.clock()
-            self.source_age_at_receipt = max(0.0, age, result.source_age_seconds)
+            self.source_age_at_receipt = max(0.0, age)
+            self.expiry_origin_unix_seconds = self.expiry_origin(result)
             self.accepted += 1
             self.status = "path_updated"
             self.events.append({"event": "path_updated", "frame_id": capture.frame_id,
@@ -189,8 +219,7 @@ class StreamFollower:
                 return
             if not self.path:
                 return
-            age = max(self.wall_clock() - self.capture.captured_at_unix_seconds,
-                      self.source_age_at_receipt + self.clock() - self.result_at)
+            age = self.path_age()
             if age > self.path_timeout or age < -0.25:
                 self._invalidate("stale_path")
                 return
@@ -235,9 +264,12 @@ class StreamView:
         self.follower = follower
         self.figure, self.axes = plt.subplots(figsize=(11, 7))
         self.figure.subplots_adjust(left=0.09, right=0.72, bottom=0.14, top=0.85)
-        self.figure.suptitle("VAMOS live Zenoh paths | 2D simulation", fontsize=15)
+        cyclic = hasattr(follower, "feedback")
+        self.figure.suptitle("VAMOS stop / observe / infer / move | 2D simulation" if cyclic
+                            else "VAMOS live Zenoh paths | 2D simulation", fontsize=15)
         self.figure.text(0.09, 0.92,
-                         f"Static-image capture pose fixed / {follower.projector.camera.calibration_status} calibration / no robot commands",
+                         ("Static image reused at simulated stop poses" if cyclic else "Static-image capture pose fixed")
+                         + f" / {follower.projector.camera.calibration_status} calibration / no robot commands",
                          fontsize=9)
         self.axes.set_xlabel("World x [m]")
         self.axes.set_ylabel("World y [m]")
@@ -295,6 +327,12 @@ class StreamView:
                            f"v: {command['vx']:.3f} m/s\nw: {command['vyaw']:+.3f} rad/s\n\n"
                            f"Pose [m]\nx: {pose['x']:.2f}\ny: {pose['y']:.2f}\n\n"
                            "Refresh keeps the\ncapture pose fixed.\n\nStatic-image demo,\nnot moving-camera\nnavigation.")
+        if "cycle_id" in s:
+            self.info.set_text(f"{display_status}\n\nCycle: {s['cycle_id']}\nPhase: {s['cycle_phase']}\n"
+                               f"Steps: {s['steps_completed']}\nAccepted: {s['accepted']}\n\n"
+                               f"v: {command['vx']:.3f} m/s\nw: {command['vyaw']:+.3f} rad/s\n\n"
+                               f"Pose [m]\nx: {pose['x']:.2f}\ny: {pose['y']:.2f}\n\n"
+                               "Same image reused\nat each simulated\nstop pose.\nView does not move.")
         self.figure.canvas.draw_idle()
 
 
@@ -320,10 +358,22 @@ def run_session(follower: StreamFollower, keys: dict, zenoh_config, stop, *, hea
                 callback(NodeState, follower.receive_state, "state")))
             resources.enter_context(session.declare_subscriber(keys["command"],
                 callback(ControlCommand, follower.receive_control, "control")))
+            feedback = None
+            if hasattr(follower, "feedback"):
+                feedback = resources.enter_context(session.declare_publisher(keys["executor_state"],
+                    encoding=JSON_ENCODING, congestion_control=zenoh.CongestionControl.DROP))
+
+            def advance():
+                follower.tick()
+                if feedback is not None:
+                    state = follower.feedback()
+                    if state is not None:
+                        feedback.put(state.model_dump_json())
+
             if headless:
-                deadline = time.monotonic() + duration
+                deadline = math.inf if duration is None else time.monotonic() + duration
                 while not stop.is_set() and time.monotonic() < deadline:
-                    follower.tick()
+                    advance()
                     stop.wait(0.05)
             else:
                 import matplotlib.pyplot as plt
@@ -335,7 +385,7 @@ def run_session(follower: StreamFollower, keys: dict, zenoh_config, stop, *, hea
                     if stop.is_set():
                         plt.close(view.figure)
                         return
-                    follower.tick()
+                    advance()
                     view.draw()
 
                 view.animation = FuncAnimation(view.figure, tick, interval=50,
@@ -369,16 +419,22 @@ def main() -> int:
     parser.add_argument("--path-timeout", type=float, default=3.0)
     parser.add_argument("--state-timeout", type=float, default=1.0)
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--duration", type=float, default=30.0, help="Headless wall-clock duration [s]")
+    parser.add_argument("--duration", type=float, help="Headless duration [s]; default runs until stopped")
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
-    if not math.isfinite(args.duration) or args.duration <= 0:
+    if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0):
         parser.error("--duration must be finite and positive")
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     try:
         config = load_node_config(args.node_config)
-        follower = StreamFollower(GroundCamera.load(args.camera), args.candidate,
-                                  args.path_timeout, args.state_timeout)
+        if config.inference and config.inference.execution_mode == "stop_go":
+            from stop_go import StopGoFollower
+
+            follower = StopGoFollower(GroundCamera.load(args.camera), config.inference.stop_go,
+                                     args.candidate, args.path_timeout, args.state_timeout)
+        else:
+            follower = StreamFollower(GroundCamera.load(args.camera), args.candidate,
+                                      args.path_timeout, args.state_timeout)
         with stop_on_signals() as stop:
             run_session(follower, config.keys(), zenoh.Config.from_file(str(args.zenoh_config)), stop,
                         headless=args.headless, duration=args.duration, output_dir=args.output_dir)
