@@ -16,10 +16,10 @@ from stream_simulator import StreamFollower
 
 class StopGoFollower(StreamFollower):
     def __init__(self, camera, settings: StopGoConfig, candidate=0, path_timeout=3.0,
-                 state_timeout=1.0, clock=time.monotonic, wall_clock=time.time):
+                 state_timeout=1.0, clock=time.monotonic, wall_clock=time.time, selection="index"):
         self.settings = settings
         self.executor_session_id = str(uuid4())
-        super().__init__(camera, candidate, path_timeout, state_timeout, clock, wall_clock)
+        super().__init__(camera, candidate, path_timeout, state_timeout, clock, wall_clock, selection)
 
     def reset(self):
         running = self.node_state is not None and self.node_state.inference.enabled

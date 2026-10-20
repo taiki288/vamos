@@ -24,15 +24,19 @@ from config import ControlCommand, JSON_ENCODING, NodeState, TrajectoryResult, l
 from controller import Pose2D, PurePursuitController, VelocityCommand
 from node import HERE, has_encoding, stop_on_signals
 from projection import GroundCamera, GroundProjector, path_to_world
+from selection import select_candidate
 
 
 class StreamFollower:
     """Thread-safe latest-path controller, with bounded history and expiry."""
 
     def __init__(self, camera: GroundCamera, candidate: int = 0, path_timeout: float = 3.0,
-                 state_timeout: float = 1.0, clock=time.monotonic, wall_clock=time.time):
+                 state_timeout: float = 1.0, clock=time.monotonic, wall_clock=time.time, selection="index"):
         if type(candidate) is not int or candidate < 0:
             raise ValueError("candidate must be a nonnegative integer")
+        if selection not in ("index", "medoid"):
+            raise ValueError("selection must be index or medoid")
+        self.selection = selection
         for value in (path_timeout, state_timeout):
             if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                 raise ValueError("timeouts must be finite and positive")
@@ -184,11 +188,11 @@ class StreamFollower:
             self.source_id = capture.source_id
             try:
                 self.projector.camera.check_image_size(result.image_width, result.image_height)
-                if self.candidate >= len(result.trajectories):
-                    raise ValueError("selected candidate is missing")
-                projected = self.projector.project_path(result.trajectories[self.candidate], self.candidate)
-                if not projected.usable:
-                    raise ValueError(projected.stop_reason or "fewer than two distinct points")
+                selection = select_candidate(result.trajectories, self.projector,
+                                             strategy=self.selection, index=self.candidate)
+                if not selection.usable:
+                    raise ValueError(selection.reason)
+                projected = selection.path
                 pose = self.path_origin(capture)
                 path = path_to_world(projected.points_robot_m, pose)
             except ValueError as error:
@@ -203,6 +207,7 @@ class StreamFollower:
             self.accepted += 1
             self.status = "path_updated"
             self.events.append({"event": "path_updated", "frame_id": capture.frame_id,
+                                "candidate": selection.index, "selection": selection.reason,
                                 "capture_pose": asdict(pose), "robot_pose": asdict(self.pose),
                                 "first_world_point": path[0], "truncated": projected.truncated})
             # Cancel the old command immediately; the next tick computes a new one.
@@ -248,6 +253,7 @@ class StreamFollower:
             return {"status": self.status, "last_status": self.last_status, "paused": self.paused,
                     "pose": asdict(self.pose), "simulated_motion_seconds": self.elapsed,
                     "command": self.command.as_message(), "candidate": self.candidate,
+                    "selection": self.selection,
                     "received": self.received, "accepted": self.accepted, "rejected": dict(self.rejected),
                     "path_world_m": self.path, "trail_world_m": list(self.trail), "target_world_m": self.target,
                     "distance_to_end_m": self.distance_to_end,
@@ -415,7 +421,9 @@ def main() -> int:
     parser.add_argument("--node-config", type=Path, default=HERE / "inference-node-config.example.json5")
     parser.add_argument("--zenoh-config", type=Path, default=HERE / "peer-zenoh-config.example.json5")
     parser.add_argument("--camera", type=Path, default=HERE / "ground-camera.example.json")
-    parser.add_argument("--candidate", type=int, default=0)
+    parser.add_argument("--candidate", type=int, default=0, help="Fixed index used by --selection index")
+    parser.add_argument("--selection", choices=("index", "medoid"), default="medoid",
+                        help="Candidate choice; medoid picks the consensus of the usable paths")
     parser.add_argument("--path-timeout", type=float, default=3.0)
     parser.add_argument("--state-timeout", type=float, default=1.0)
     parser.add_argument("--headless", action="store_true")
@@ -431,10 +439,11 @@ def main() -> int:
             from stop_go import StopGoFollower
 
             follower = StopGoFollower(GroundCamera.load(args.camera), config.inference.stop_go,
-                                     args.candidate, args.path_timeout, args.state_timeout)
+                                     args.candidate, args.path_timeout, args.state_timeout,
+                                     selection=args.selection)
         else:
             follower = StreamFollower(GroundCamera.load(args.camera), args.candidate,
-                                      args.path_timeout, args.state_timeout)
+                                      args.path_timeout, args.state_timeout, selection=args.selection)
         with stop_on_signals() as stop:
             run_session(follower, config.keys(), zenoh.Config.from_file(str(args.zenoh_config)), stop,
                         headless=args.headless, duration=args.duration, output_dir=args.output_dir)
