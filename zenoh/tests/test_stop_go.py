@@ -112,21 +112,46 @@ class StopGoTests(unittest.TestCase):
         self.assertEqual(started[-1]["anchor_source"], "simulated_stop_pose")
         self.assertGreater(self.follower.pose.x, pose.x)
 
-    def test_pre_stop_and_unannotated_images_cannot_start_inference(self):
+    def test_pre_stop_and_early_images_cannot_start_inference(self):
         self.start()
         for _ in range(5):
-            self.pump()
+            self.pump(frame=False)
             if self.state.snapshot().cycle.phase == "waiting_image":
                 break
         self.assertEqual(self.state.snapshot().cycle.phase, "waiting_image")
         self.assertIsNone(self.state.begin_inference())  # Latest frame preceded stop confirmation.
         old = CaptureContext(source_id="static-test", frame_id=999, captured_at_unix_seconds=self.wall - 1)
+        self.now += 0.3
         self.state.receive_frame(Image.new("RGB", (64, 48)), self.now, old)
-        self.assertIsNone(self.state.begin_inference())
+        self.assertIsNone(self.state.begin_inference())  # Annotated as captured before the stop.
+
+    def test_start_ready_reflects_start_preconditions(self):
+        ready = self.state.snapshot()
+        self.assertTrue(ready.start_ready)
+        self.assertEqual(ready.status_message, "Ready; send start.")
+        self.start()
+        self.assertFalse(self.state.snapshot().start_ready)
+        self.state.receive_command(ControlCommand(type="stop"))
+        self.now += 5.0  # Image, heartbeat and executor feedback all expire.
+        blocked = self.state.snapshot()
+        self.assertFalse(blocked.start_ready)
+        self.state.receive_command(ControlCommand(type="heartbeat"))
+        self.assertIn("fresh image", self.state.snapshot().status_message)
+
+    def test_raw_camera_frames_start_inference_after_observation_delay(self):
+        self.start()
+        for _ in range(5):
+            self.pump(frame=False)
+            if self.state.snapshot().cycle.phase == "waiting_image":
+                break
+        delay = self.config.inference.stop_go.observation_delay_seconds
+        self.state.receive_frame(Image.new("RGB", (64, 48)), self.now + delay / 2)
+        self.assertIsNone(self.state.begin_inference())  # Camera latency window after the stop.
+        self.now += delay
         self.state.receive_frame(Image.new("RGB", (64, 48)), self.now)
-        self.assertIsNone(self.state.begin_inference())
-        self.pump()
-        self.assertIsNotNone(self.state.begin_inference())
+        request = self.state.begin_inference()
+        self.assertIsNotNone(request)
+        self.assertIsNone(request.frame.capture)
 
     def test_stop_during_inference_discards_result_and_requires_restart(self):
         self.start()
@@ -194,7 +219,7 @@ class StopGoTests(unittest.TestCase):
         self.now += 2
         self.state.receive_frame(Image.new("RGB", (64, 48)), self.now)
         self.state.receive_command(ControlCommand(type="heartbeat"))
-        with self.assertRaisesRegex(ValueError, "simulator"):
+        with self.assertRaisesRegex(ValueError, "executor"):
             self.start()
         import matplotlib
         matplotlib.use("Agg")

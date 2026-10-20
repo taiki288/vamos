@@ -18,6 +18,8 @@
       max_step_distance_m: 0.2,
       max_step_yaw_rad: 0.35,
       stop_settle_seconds: 0.2,
+      stop_confirm_timeout_seconds: 15.0, // Includes a Go2 stand-up on the first cycle.
+      observation_delay_seconds: 0.2, // Camera latency margin after stopped feedback.
     },
     auto_start: false, // Start explicitly from zenoh/cli.py.
     model_key: "mateoguaman/vamos",

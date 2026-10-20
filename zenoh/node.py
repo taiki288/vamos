@@ -92,6 +92,7 @@ class TransportState:
         self._cycle_inference_id = None
         self._cycle_at = clock()
         self._capture_after = None
+        self._stop_confirmed_at = None
         self._min_cycle_frame = 0
         self._executor = None
         self._executor_at = None
@@ -137,6 +138,7 @@ class TransportState:
             elif self._cycle_phase == "waiting_stop" and state.motion == "stopped":
                 self._min_cycle_frame = 0 if self._frame is None else self._frame.sequence
                 self._capture_after = self.wall_clock()
+                self._stop_confirmed_at = self.clock()
                 self._observation_pose = state.pose
                 self._set_cycle_phase("waiting_image")
             elif (self._cycle_phase == "moving" and state.motion == "stopped"
@@ -216,13 +218,9 @@ class TransportState:
             self._goal_revision += 1
             self._epoch += 1
             return
-        if not self._model_loaded:
-            raise ValueError("model is still loading")
-        status = self.snapshot()
-        if not status.camera.fresh or not status.cli_connected:
-            raise ValueError("start requires a fresh image and heartbeat")
-        if self.stop_go and (not status.cycle.executor_fresh or status.cycle.executor_motion != "stopped"):
-            raise ValueError("start requires a connected, stopped stop-go simulator")
+        blocker = self._start_blocker(self.snapshot())
+        if blocker:
+            raise ValueError(blocker)
         if not self._inference_enabled:
             self._epoch += 1
         self._inference_enabled = True
@@ -233,6 +231,16 @@ class TransportState:
             self._cycle_id += 1
             self._cycle_inference_id = None
             self._set_cycle_phase("waiting_stop")
+
+    def _start_blocker(self, status: NodeState) -> str | None:
+        """Return why start would be rejected for an otherwise valid request."""
+        if not self._model_loaded:
+            return "model is still loading"
+        if not status.camera.fresh or not status.cli_connected:
+            return "start requires a fresh image and heartbeat"
+        if self.stop_go and (not status.cycle.executor_fresh or status.cycle.executor_motion != "stopped"):
+            return "start requires a connected, stopped stop-go executor"
+        return None
 
     def _expire_inputs(self, now):
         if self._inference_enabled and self._inputs_seen:
@@ -246,7 +254,7 @@ class TransportState:
                     # Allow the new cycle/epoch to be echoed once after a transition.
                     if now - self._cycle_at > settings.executor_timeout_seconds:
                         self._pause("Executor feedback expired; start required after recovery.")
-                timeout = {"waiting_stop": settings.executor_timeout_seconds,
+                timeout = {"waiting_stop": settings.stop_confirm_timeout_seconds,
                            "waiting_image": settings.image_wait_timeout_seconds,
                            "inferencing": settings.inference_timeout_seconds,
                            "moving": settings.movement_timeout_seconds}.get(self._cycle_phase)
@@ -285,9 +293,15 @@ class TransportState:
             if self.stop_go:
                 if self._cycle_phase != "waiting_image" or not self._executor_fresh(self.clock()):
                     return None
+                # Any camera works: the frame must arrive after stopped feedback
+                # plus the observation delay. Annotated demo frames must also
+                # have been captured after it.
                 capture = frame.capture
-                if (frame.sequence <= self._min_cycle_frame or capture is None
-                        or capture.captured_at_unix_seconds <= self._capture_after
+                delay = self.config.inference.stop_go.observation_delay_seconds
+                if (frame.sequence <= self._min_cycle_frame
+                        or frame.received_at < self._stop_confirmed_at + delay):
+                    return None
+                if capture is not None and (capture.captured_at_unix_seconds <= self._capture_after
                         or capture.captured_at_unix_seconds > self.wall_clock() + 0.25):
                     return None
             identity = (self._epoch, frame.sequence)
@@ -356,11 +370,8 @@ class TransportState:
                 lifecycle = "stopping"
             if self._stopped:
                 lifecycle = "stopped"
-            extra = {} if self.config.inference is None else {
-                "stage": "inference",
-                "status_message": self._pause_reason or "Image-path inference only; no robot commands are published.",
-            }
-            return NodeState(
+            extra = {} if self.config.inference is None else {"stage": "inference"}
+            state = NodeState(
                 **extra,
                 cycle=CycleState(mode="stop_go" if self.stop_go else "continuous", phase=self._cycle_phase,
                     cycle_id=self._cycle_id, completed=self._cycle_completed, inference_id=self._cycle_inference_id,
@@ -394,6 +405,19 @@ class TransportState:
                     last_duration_seconds=self._last_duration, last_error=self._inference_error,
                 ),
             )
+            if self.config.inference is None:
+                return state
+            blocker = self._start_blocker(state)
+            if self._shutting_down or self._stopped or self._active:
+                blocker = blocker or "inference is busy or shutting down"
+            ready = not self._inference_enabled and blocker is None
+            if self._inference_enabled:
+                message = "Running stop/observe/infer/move cycles." if self.stop_go else "Running inference."
+            else:
+                message = "Ready; send start." if ready else f"Not ready: {blocker}."
+                if self._pause_reason:
+                    message = f"{self._pause_reason} {message}"
+            return state.model_copy(update={"start_ready": ready, "status_message": message})
 
 
 def has_encoding(sample, expected: str) -> bool:

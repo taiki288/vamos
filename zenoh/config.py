@@ -64,6 +64,11 @@ class StopGoConfig(Settings):
     max_step_yaw_rad: PositiveSeconds = 0.35
     stop_settle_seconds: PositiveSeconds = 0.2
     executor_timeout_seconds: PositiveSeconds = 1.0
+    # Waiting for stopped feedback includes a Go2 stand-up on the first cycle.
+    stop_confirm_timeout_seconds: PositiveSeconds = 15.0
+    # Frames must be received this long after stopped feedback, so camera
+    # pipeline latency cannot pass off a pre-stop image as the observation.
+    observation_delay_seconds: Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)] = 0.2
     image_wait_timeout_seconds: PositiveSeconds = 5.0
     movement_timeout_seconds: PositiveSeconds = 4.0
 
@@ -71,6 +76,8 @@ class StopGoConfig(Settings):
     def timeouts(self):
         if self.movement_timeout_seconds <= self.max_step_seconds + self.stop_settle_seconds:
             raise ValueError("movement timeout must exceed step duration plus settling time")
+        if self.image_wait_timeout_seconds <= self.observation_delay_seconds:
+            raise ValueError("image wait timeout must exceed the observation delay")
         return self
 
 
@@ -228,7 +235,7 @@ class NodeState(Settings):
     last_control_ack: ControlAck | None = None
     stage: Literal["transport", "inference"] = "transport"
     lifecycle: Literal["loading", "idle", "running", "paused", "error", "stopping", "stopped"]
-    start_ready: Literal[False] = False
+    start_ready: bool = False
     status_message: str = "Transport only; inference and robot commands are not implemented."
     cli_connected: bool
     received_commands: int
