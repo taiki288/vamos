@@ -517,7 +517,9 @@ class ExecutorRuntime:
 
 
 def main() -> int:
-    from node import stop_on_signals
+    from node import stop_on_signals, tolerate_unencodable_output
+
+    tolerate_unencodable_output()
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--node-config", type=Path, default=HERE / "inference-node-config.example.json5",

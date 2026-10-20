@@ -101,6 +101,13 @@ class InferenceTests(unittest.TestCase):
         self.state.request_shutdown()
         self.assertFalse(self.state.complete_inference(request, 0.1, Mock()))
 
+    def test_model_load_failure_is_reported_instead_of_loading(self):
+        state = TransportState(self.config, clock=lambda: self.now)
+        state.fail_inference(RuntimeError("load failed"))
+        status = state.snapshot()
+        self.assertFalse(status.start_ready)
+        self.assertIn("model failed to load", status.status_message)
+
     def test_invalid_paths_are_filtered_by_adapter(self):
         generate = Mock(return_value=([[[1, 2], [20, 30]], [[float("nan"), 0]], [[64, 2]]],
                                       ["valid", "nan", "outside"], None))

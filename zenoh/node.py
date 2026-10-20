@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import signal
+import sys
 import time
 from contextlib import ExitStack, contextmanager
 from collections import OrderedDict
@@ -235,7 +236,8 @@ class TransportState:
     def _start_blocker(self, status: NodeState) -> str | None:
         """Return why start would be rejected for an otherwise valid request."""
         if not self._model_loaded:
-            return "model is still loading"
+            return ("model failed to load; check the node log and restart it" if self._inference_error
+                    else "model is still loading")
         if not status.camera.fresh or not status.cli_connected:
             return "start requires a fresh image and heartbeat"
         if self.stop_go and (not status.cycle.executor_fresh or status.cycle.executor_motion != "stopped"):
@@ -621,7 +623,19 @@ def stop_on_signals():
             signal.signal(signum, handler)
 
 
+def tolerate_unencodable_output():
+    """Keep redirected Windows (e.g. cp932) logs from failing on emoji/Unicode.
+
+    vamos_demo prints emoji while loading the model; with stdout redirected to
+    a file, a non-UTF-8 console code page otherwise aborts model loading.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
+
+
 def main() -> int:
+    tolerate_unencodable_output()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--node-config", type=Path, default=HERE / "node-config.example.json5")
     parser.add_argument("--zenoh-config", type=Path, default=HERE / "zenoh-config.example.json5")
