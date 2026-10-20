@@ -1,0 +1,6 @@
+{
+  // Robot-free demo only: go2_executor.py against tools/fake_go2.py, using the
+  // ASSUMED example calibration. Never use this file with a real Go2.
+  camera_calibration: "../ground-camera.example.json",
+  allow_assumed_calibration: true,
+}

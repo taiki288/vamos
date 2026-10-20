@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
+import sys
 from threading import Lock
 import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import zenoh
 

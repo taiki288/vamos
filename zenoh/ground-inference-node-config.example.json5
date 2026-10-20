@@ -5,7 +5,6 @@
   camera: { key: "camera/front", frame_freshness_seconds: 2.5 },
   go2: { zenoh_key_prefix: "unitree/go2", node_state_timeout_seconds: 0.5 },
   inference: {
-    execution_mode: "stop_go",
     stop_go: {
       inference_timeout_seconds: 60.0,
       max_step_seconds: 1.0,
@@ -15,7 +14,6 @@
       stop_confirm_timeout_seconds: 15.0, // Includes a Go2 stand-up on the first cycle.
       observation_delay_seconds: 0.2, // Camera latency margin after stopped feedback.
     },
-    auto_start: false,
     model_key: "mateoguaman/vamos",
     device: "cuda",
     num_samples: 10,
@@ -23,7 +21,6 @@
     temperature: 0.05,
     disable_compile: true,
     frequency_hz: 1.0,
-    max_frame_age_seconds: 5.0, // Continuous mode; stop_go uses its bounded inference timeout.
     shutdown_timeout_seconds: 30.0,
     goal: {
       x: 0.5,

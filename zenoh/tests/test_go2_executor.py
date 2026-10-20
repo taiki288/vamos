@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 import json
-import math
 from pathlib import Path
 from queue import Empty, Queue
 import socket
@@ -13,12 +12,14 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 from PIL import Image
 from pydantic import ValidationError
 import zenoh
 
 from config import ControlCommand, Go2NodeState, NodeConfig, TrajectoryResult
+from fake_go2 import SimulatedGo2
 from controller import VelocityCommand
 from go2_executor import ExecutorConfig, ExecutorRuntime, Go2StepExecutor, load_camera
 from node import TransportState
@@ -31,46 +32,30 @@ STRAIGHT = [(32, 44), (32, 36), (32, 32)]
 ABOVE_HORIZON = [(32, 10), (32, 5)]
 
 
-class FakeGo2:
-    """Observed-state Go2 stand-in: posture changes take time, motion follows velocity."""
+class FakeGo2(SimulatedGo2):
+    """The shared simulated Go2, fed directly from executor outputs and recording them."""
 
     def __init__(self, state="down"):
-        self.state, self.motion = state, "quiescent"
-        self.connected = self.accepting = True
-        self.transition = None  # (target, completes_at)
-        self.velocity = VelocityCommand()
-        self.velocity_at = -math.inf
+        super().__init__(state, posture_seconds=0.5)
         self.postures, self.velocities = [], []
 
     def command(self, now, output):
         if output.posture is not None:
             self.postures.append(output.posture)
-            target = "ready_stand" if output.posture == "stand" else "down"
-            self.transition = (target, now + 0.5)
+            self.receive({"type": "posture", "posture": output.posture}, now)
         if output.velocity is not None:
             self.velocities.append(output.velocity)
-            if self.state in ("ready_stand", "locomotion"):
-                self.velocity, self.velocity_at = output.velocity, now
+            self.receive(output.velocity.as_message(), now)
 
-    def step(self, now):
-        if now - self.velocity_at > 0.25:  # Go2 node velocity timeout.
-            self.velocity = VelocityCommand()
-        if self.transition is not None:
-            target, completes_at = self.transition
-            self.motion = "moving"
-            if now >= completes_at:
-                self.state, self.transition = target, None
-        else:
-            self.motion = "moving" if self.velocity != VelocityCommand() else "quiescent"
-        return Go2NodeState.model_validate({
-            "robot_connected": self.connected, "accepting_commands": self.accepting,
-            "robot_state": {"state": self.state, "motion": self.motion}})
+    def observe(self, now):
+        return Go2NodeState.model_validate(self.step(now))
 
 
 class Go2ExecutorTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self, stop_go=None):
         self.now, self.wall = 100.0, 1000.0
-        self.node_config = NodeConfig.model_validate(CONFIG)
+        self.node_config = NodeConfig.model_validate({**CONFIG, "inference": {**CONFIG["inference"], "stop_go": {
+            **CONFIG["inference"]["stop_go"], **(stop_go or {})}}})
         self.node = TransportState(self.node_config, clock=lambda: self.now, wall_clock=lambda: self.wall)
         self.node.model_loaded("cpu")
         self.config = ExecutorConfig(camera_calibration="unused.json", allow_assumed_calibration=True)
@@ -95,7 +80,7 @@ class Go2ExecutorTests(unittest.TestCase):
         self.node.receive_frame(Image.new("RGB", (64, 48)), self.now)  # Raw camera frame.
         self.executor.receive_node_state(self.node.snapshot())
         if self.go2_fresh:
-            self.executor.receive_go2_state(self.robot.step(self.now))
+            self.executor.receive_go2_state(self.robot.observe(self.now))
         output = self.executor.tick(self.now)
         self.robot.command(self.now, output)
         if output.feedback is not None:
@@ -143,6 +128,17 @@ class Go2ExecutorTests(unittest.TestCase):
         # The next cycle observes from the new stopped pose; no inference while moving.
         self.pump_until(lambda: self.node.snapshot().cycle.completed >= 2)
         self.assertEqual(self.robot.postures, ["stand"])
+
+    def test_turn_limit_ends_a_rotating_step(self):
+        self.setUp({"max_step_seconds": 1.0, "max_step_yaw_rad": 0.1})
+        self.paths = [[(2, 44), (2, 36), (2, 32)]]  # Far left: rotate in place.
+        self.start()
+        self.pump_until(lambda: any(e["event"] == "step_finished" for e in self.executor.events))
+        finished = [e for e in self.executor.events if e["event"] == "step_finished"][0]
+        self.assertEqual(finished["reason"], "max_step_yaw")
+        self.assertLessEqual(finished["yaw_rad"], 0.1 + self.config.motion.max_yaw_rate_rps * 0.05 + 1e-9)
+        self.assertGreater(self.executor.pose.yaw, 0)  # Counter-clockwise toward the left path.
+        self.assertTrue(all(v.vx == 0 for v in self.robot.velocities))
 
     def test_operator_stop_zeroes_then_requests_down_until_rest(self):
         self.start()

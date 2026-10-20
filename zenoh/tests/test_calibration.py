@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+
 from calibrate_camera import Marker, calibrate_intrinsics, estimate_mount, find_checkerboards, main, verify_markers
 from projection import GroundCamera, GroundProjector
 

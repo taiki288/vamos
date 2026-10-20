@@ -156,7 +156,7 @@ class CliRuntime:
             if not ack.accepted:
                 raise ValueError(f"Node rejected {kind}: {ack.message}")
             return kind != "stop" or (not update.inference.enabled and not update.inference.active
-                and (update.cycle.mode != "stop_go" or
+                and (update.stage != "inference" or
                      (update.cycle.executor_fresh and update.cycle.executor_motion == "stopped")))
 
         update = self.cache.wait(acknowledged, self.command_timeout)
@@ -180,13 +180,12 @@ class CliRuntime:
                 raise TimeoutError("Previous inference has not finished; start was not sent; check status")
             if update.node_session_id != state.node_session_id:
                 raise RuntimeError("Node restarted while waiting; refresh state before starting")
-        if state.cycle.mode == "stop_go":
-            update = self.cache.wait(lambda value: value.node_session_id != state.node_session_id or
-                (value.cycle.executor_fresh and value.cycle.executor_motion == "stopped"), self.command_timeout)
-            if update is None:
-                raise TimeoutError("No stopped stop-go executor confirmed; check the executor/simulator and Go2 state")
-            if update.node_session_id != state.node_session_id:
-                raise RuntimeError("Node restarted while waiting for the executor")
+        update = self.cache.wait(lambda value: value.node_session_id != state.node_session_id or
+            (value.cycle.executor_fresh and value.cycle.executor_motion == "stopped"), self.command_timeout)
+        if update is None:
+            raise TimeoutError("No stopped executor confirmed; check go2_executor.py and Go2 state")
+        if update.node_session_id != state.node_session_id:
+            raise RuntimeError("Node restarted while waiting for the executor")
         update = self._request("start")
         self.output(f"Inference started (goal revision {update.goal_revision}).")
         return update
@@ -196,7 +195,7 @@ class CliRuntime:
         # a stale cached observation being mistaken for confirmation.
         update = self._request("stop")
         self.output("Stopped; pending inference finished" +
-                    (" and the executor confirmed stopped." if update.cycle.mode == "stop_go" else "."))
+                    (" and the executor confirmed stopped." if update.stage == "inference" else "."))
         return update
 
     def set_goal(self, goal: GoalConfig):
@@ -223,7 +222,7 @@ class CliRuntime:
             self.output(f"goal=({state.goal.x:g}, {state.goal.y:g}) revision={state.goal_revision} "
                         f"instruction={state.goal.instruction!r}")
         self.output(state.status_message)
-        if state.cycle.mode == "stop_go":
+        if state.stage == "inference":
             cycle = state.cycle
             self.output(f"cycle={cycle.cycle_id} phase={cycle.phase} completed_steps={cycle.completed} "
                         f"executor_fresh={cycle.executor_fresh} motion={cycle.executor_motion}")
@@ -271,7 +270,7 @@ class CliRuntime:
                 self.output("Watch stopped; inference remains in its current state.")
         elif name == "help":
             self.output("start | stop | status | goal <x 0..1> <y 0..1> | ins <text> | watch [seconds] | quit")
-            self.output("processes | logs [node|source|viewer|simulator]")
+            self.output("processes | logs [node|camera|go2|executor|viewer]")
             self.output("Goal/instruction changes stop inference and leave it paused. This CLI sends no Go2 commands.")
         elif name in ("processes", "logs"):
             if self.processes is None:
@@ -312,18 +311,17 @@ def main() -> int:
     parser.add_argument("--state-timeout", type=float, default=1)
     parser.add_argument("--command-timeout", type=float, default=15)
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--demo", action="store_true", help="Also publish a local test image and simulated Go2 state")
+    mode.add_argument("--demo", action="store_true",
+                      help="Robot-free demo: test camera, simulated Go2 and go2_executor.py with the demo config")
     mode.add_argument("--attach", action="store_true", help="Connect to an already running node instead of launching one")
     parser.add_argument("--viewer", action="store_true", help="Open the image-space path viewer")
-    parser.add_argument("--simulator", action="store_true", help="Open the static-image 2D follower")
+    parser.add_argument("--simulator", action="store_true", help="Open the simulated Go2 window (requires --demo)")
     parser.add_argument("--node-zenoh-config", type=Path, default=HERE / "zenoh-config.example.json5")
-    parser.add_argument("--peer-config", type=Path, default=HERE / "diagnostic-peer-config.example.json5")
     parser.add_argument("--image", type=Path, help="Demo image override (requires --demo)")
-    parser.add_argument("--camera", type=Path, default=HERE / "ground-camera.example.json")
     parser.add_argument("--log-dir", type=Path, default=HERE.parent / "outputs/cli")
     args = parser.parse_args()
-    if args.image and not args.demo:
-        parser.error("--image requires --demo")
+    if (args.image or args.simulator) and not args.demo:
+        parser.error("--image and --simulator require --demo")
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     try:
         config = load_node_config(args.node_config)
@@ -341,17 +339,15 @@ def main() -> int:
                                 "--zenoh-config", args.node_zenoh_config.resolve())
                 processes.wait_for_listener(addresses)
             if args.demo:
-                # The CLI owns heartbeat; the robot-free demo needs the fake Go2 state.
-                source_args = [*shared, "--peer-config", args.peer_config.resolve(), "--fake-go2-state"]
-                if args.image:
-                    source_args.extend(("--image", args.image.resolve()))
-                processes.start("source", HERE / "diagnostic_peer.py", *source_args)
+                # The CLI owns heartbeat. The executor is the real one, driving a simulated Go2.
+                tools = HERE / "tools"
+                camera_args = [*shared, *(("--image", args.image.resolve()) if args.image else ())]
+                processes.start("camera", tools / "fake_camera.py", *camera_args)
+                processes.start("go2", tools / "fake_go2.py", *shared, *(() if args.simulator else ("--headless",)))
+                processes.start("executor", HERE / "go2_executor.py", *shared,
+                                "--executor-config", tools / "demo-executor-config.json5")
             if args.viewer:
-                processes.start("viewer", HERE / "viewer.py", *shared)
-            if args.simulator or (args.demo and config.inference.execution_mode == "stop_go"):
-                simulator_args = [] if args.simulator else ["--headless"]
-                processes.start("simulator", HERE / "stream_simulator.py", *shared,
-                                "--camera", args.camera.resolve(), *simulator_args)
+                processes.start("viewer", HERE / "tools" / "viewer.py", *shared)
             runtime.run(zenoh.Config.from_file(str(args.zenoh_config)))
         return 0
     except KeyboardInterrupt:

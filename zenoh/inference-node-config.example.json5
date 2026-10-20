@@ -11,7 +11,6 @@
     node_state_timeout_seconds: 0.5,
   },
   inference: {
-    execution_mode: "stop_go",
     stop_go: {
       inference_timeout_seconds: 60.0,
       max_step_seconds: 1.0,
@@ -21,15 +20,13 @@
       stop_confirm_timeout_seconds: 15.0, // Includes a Go2 stand-up on the first cycle.
       observation_delay_seconds: 0.2, // Camera latency margin after stopped feedback.
     },
-    auto_start: false, // Start explicitly from zenoh/cli.py.
     model_key: "mateoguaman/vamos",
     device: "cuda", // "auto" or "cpu" may also be selected explicitly.
     num_samples: 5,
     max_new_tokens: 10,
     temperature: 0.05,
-    disable_compile: true, // Keep streaming results within the freshness window.
-    frequency_hz: 1.0, // Missed inference slots are skipped; no overlap/backlog.
-    max_frame_age_seconds: 5.0, // Continuous mode; stop_go uses its bounded inference timeout.
+    disable_compile: true, // Predictable latency; compilation warm-up exceeded time budgets.
+    frequency_hz: 1.0, // How often the worker checks for an observation to infer.
     shutdown_timeout_seconds: 30.0,
     goal: {
       x: 0.434,

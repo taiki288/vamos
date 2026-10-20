@@ -20,13 +20,15 @@ import zenoh
 from cli import CliRuntime, StateCache
 from config import ControlCommand, GoalConfig, NodeConfig, TrajectoryResult
 from inference import InferenceOutput, VAMOSEngine
+from go2_executor import ExecutorConfig, Go2StepExecutor
 from node import NodeRuntime, TransportState
-from stream_simulator import StreamFollower
+from projection import GroundCamera
+from stop_go_support import EchoExecutor, report_stopped
 from test_transport import BASE_CONFIG, image_bytes, wait_for_listener
-from test_stream_simulator import CAMERA
 
 
-CONFIG = {**BASE_CONFIG, "inference": {"goal": {"x": 0.5, "y": 0.6}, "device": "cpu", "frequency_hz": 20.0}}
+CONFIG = {**BASE_CONFIG, "inference": {"goal": {"x": 0.5, "y": 0.6}, "device": "cpu", "frequency_hz": 20.0,
+                                       "stop_go": {"observation_delay_seconds": 0.0}}}
 
 
 class ControlTests(unittest.TestCase):
@@ -38,12 +40,15 @@ class ControlTests(unittest.TestCase):
         self.refresh()
 
     def refresh(self):
+        """Stopped executor feedback, then a new frame and heartbeat to observe."""
+        report_stopped(self.state)
         self.state.receive_frame(Image.new("RGB", (64, 48)), self.now)
         self.state.receive_command(ControlCommand(type="heartbeat"))
 
     def test_manual_start_is_default_and_stop_remains_unconditional(self):
         self.assertIsNone(self.state.begin_inference())
         self.state.receive_command(ControlCommand(type="start"))
+        self.refresh()
         self.assertIsNotNone(self.state.begin_inference())
         self.now += 100
         self.state.receive_command(ControlCommand(type="stop", request_id="stop", node_session_id="old-node"))
@@ -57,10 +62,12 @@ class ControlTests(unittest.TestCase):
         self.refresh()
         self.assertIsNone(self.state.begin_inference())
         self.state.receive_command(ControlCommand(type="start"))
+        self.refresh()
         self.assertIsNotNone(self.state.begin_inference())
 
     def test_stop_drain_goal_change_and_resume_cannot_publish_old_result(self):
         self.state.receive_command(ControlCommand(type="start"))
+        self.refresh()
         pending = self.state.begin_inference()
         self.state.receive_command(ControlCommand(type="stop"))
         goal = GoalConfig(x=0.7, y=0.8, instruction="New goal")
@@ -72,7 +79,9 @@ class ControlTests(unittest.TestCase):
         self.assertFalse(self.state.complete_inference(pending, 0.1, publish))
         publish.assert_not_called()
         self.state.receive_command(ControlCommand(type="goal", goal=goal))
+        self.refresh()
         self.state.receive_command(ControlCommand(type="start"))
+        self.refresh()
         next_request = self.state.begin_inference()
         self.assertEqual(next_request.goal, goal)
         self.assertEqual(next_request.goal_revision, 1)
@@ -122,23 +131,28 @@ class ControlTests(unittest.TestCase):
             with self.subTest(data=data), self.assertRaises(ValidationError):
                 ControlCommand.model_validate(data)
 
-    def test_old_epoch_result_and_reordered_state_cannot_restore_following(self):
+    def test_old_epoch_result_and_reordered_state_cannot_reach_the_executor(self):
+        executor = Go2StepExecutor(ExecutorConfig(camera_calibration="unused.json", allow_assumed_calibration=True),
+                                   self.config.inference.stop_go, GroundCamera(64, 48, 32, 32, 32, 24, 0.5),
+                                   clock=lambda: self.now)
         self.state.receive_command(ControlCommand(type="start"))
         old_state = self.state.snapshot()
-        follower = StreamFollower(CAMERA, clock=lambda: self.now, wall_clock=lambda: 1000)
-        follower.receive_state(old_state)
+        executor.receive_node_state(old_state)
         self.state.receive_command(ControlCommand(type="stop"))
-        follower.receive_state(self.state.snapshot())
-        follower.receive_state(old_state)
-        self.assertEqual(follower.node_state.control_epoch, self.state.snapshot().control_epoch)
+        executor.receive_node_state(self.state.snapshot())
+        executor.receive_node_state(old_state)  # Reordered delivery cannot roll back control.
+        self.assertEqual(executor.node.control_epoch, self.state.snapshot().control_epoch)
+        self.refresh()
         self.state.receive_command(ControlCommand(type="start"))
-        follower.receive_state(self.state.snapshot())
+        executor.receive_node_state(self.state.snapshot())
         old_result = TrajectoryResult(inference_id=1, frame_sequence=1, image_width=64, image_height=48,
             goal_pixels=(32, 32), prompt="old", trajectories=[[(32, 44), (32, 32)]], generated_texts=["old"],
             duration_seconds=0.1, source_age_seconds=0.1, device="cpu", node_session_id=old_state.node_session_id,
-            control_epoch=old_state.control_epoch, goal_revision=old_state.goal_revision)
-        self.assertFalse(follower.receive_result(old_result))
-        self.assertEqual(follower.rejected["obsolete_control_result"], 1)
+            control_epoch=old_state.control_epoch, goal_revision=old_state.goal_revision,
+            cycle_id=old_state.cycle.cycle_id)
+        executor.receive_result(old_result)
+        self.assertIsNone(executor._pending)
+        self.assertEqual(executor.events[-1]["event"], "result_ignored")
 
     def test_state_cache_does_not_return_stale_observations(self):
         cache = StateCache(1, clock=lambda: self.now)
@@ -165,6 +179,7 @@ class ControlTests(unittest.TestCase):
 
         def publish(payload):
             self.state.receive_command(ControlCommand.model_validate_json(payload))
+            report_stopped(self.state)
             cli.cache.store(self.state.snapshot())
 
         cli._publisher.put.side_effect = publish
@@ -174,6 +189,7 @@ class ControlTests(unittest.TestCase):
 
     def test_start_after_input_loss_waits_for_pending_inference(self):
         self.state.receive_command(ControlCommand(type="start"))
+        self.refresh()
         pending = self.state.begin_inference()
         self.now += 2
         self.assertFalse(self.state.snapshot().inference.enabled)
@@ -184,6 +200,7 @@ class ControlTests(unittest.TestCase):
 
         def publish(payload):
             self.state.receive_command(ControlCommand.model_validate_json(payload))
+            report_stopped(self.state)
             cli.cache.store(self.state.snapshot())
 
         cli._publisher = Mock()
@@ -262,6 +279,7 @@ class CliNetworkTests(unittest.TestCase):
                 sender.start()
                 resources.callback(lambda: (stop_camera.set(), sender.join(2)))
                 output = []
+                resources.enter_context(EchoExecutor(session, config.keys()))
                 cli = CliRuntime(config, command_timeout=5, heartbeat_interval=0.05, output=output.append)
                 with cli.connect(zenoh.Config.from_json5(client_json)):
                     self.assertFalse(cli.state().inference.enabled)

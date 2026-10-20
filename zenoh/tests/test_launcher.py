@@ -23,8 +23,9 @@ from test_transport import BASE_CONFIG
 
 class LauncherTests(unittest.TestCase):
     def test_cli_modes_launch_only_the_requested_services(self):
-        for flags, expected in (([], ["node"]), (["--demo"], ["node", "source", "simulator"]), (["--demo", "--viewer", "--simulator"],
-                ["node", "source", "viewer", "simulator"]), (["--attach"], [])):
+        demo = ["node", "camera", "go2", "executor"]
+        for flags, expected in (([], ["node"]), (["--demo"], demo), (["--demo", "--viewer", "--simulator"],
+                [*demo, "viewer"]), (["--attach"], [])):
             with self.subTest(flags=flags), patch.object(sys, "argv", ["cli.py", *flags]), \
                     patch.object(cli, "ManagedProcesses") as manager, \
                     patch.object(cli, "CliRuntime") as runtime, \
@@ -35,11 +36,12 @@ class LauncherTests(unittest.TestCase):
                 for call in owned.start.call_args_list:
                     if call.args[0] == "node":
                         self.assertIn(HERE / "inference-node-config.example.json5", call.args)
-                    if call.args[0] == "source":
-                        self.assertIn("--fake-go2-state", call.args)
-                        self.assertNotIn("--heartbeat", call.args)
-                    if call.args[0] == "simulator":
+                    if call.args[0] == "camera":
+                        self.assertNotIn("--heartbeat", call.args)  # The CLI owns heartbeat.
+                    if call.args[0] == "go2":
                         self.assertEqual("--headless" in call.args, "--simulator" not in flags)
+                    if call.args[0] == "executor":
+                        self.assertIn(HERE / "tools/demo-executor-config.json5", call.args)
                 runtime.return_value.run.assert_called_once()
                 manager.return_value.__exit__.assert_called_once()
 
@@ -83,10 +85,10 @@ class LauncherTests(unittest.TestCase):
                     check_listener_available(addresses)
                     manager.start("node", HERE / "node.py", "--zenoh-config", server)
                     manager.wait_for_listener(addresses)
-                    manager.start("source", HERE / "diagnostic_peer.py", "--zenoh-config", client, "--fake-go2-state")
+                    manager.start("camera", HERE / "tools/fake_camera.py", "--zenoh-config", client)
                     operator = CliRuntime(NodeConfig.model_validate(BASE_CONFIG), output=lambda _: None)
                     with operator.connect(zenoh.Config.from_file(str(client))):
-                        state = operator.cache.wait(lambda s: s.camera.fresh and s.go2.fresh, 8)
+                        state = operator.cache.wait(lambda s: s.camera.fresh, 8)
                         self.assertIsNotNone(state)
                         self.assertTrue(state.cli_connected)
                         for child in manager.children.values():

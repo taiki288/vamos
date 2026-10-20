@@ -21,10 +21,12 @@ import zenoh
 from config import ControlCommand, InferenceConfig, NodeConfig, NodeState, TrajectoryResult
 from inference import InferenceOutput, VAMOSEngine, build_prompt, render_preview
 from node import NodeRuntime, TransportState
+from stop_go_support import EchoExecutor, report_stopped
 from test_transport import BASE_CONFIG, image_bytes, wait_for_listener
 
 
-INFERENCE = {"goal": {"x": 0.434, "y": 0.514}, "device": "cpu", "frequency_hz": 20.0, "auto_start": True}
+INFERENCE = {"goal": {"x": 0.434, "y": 0.514}, "device": "cpu", "frequency_hz": 20.0,
+             "stop_go": {"observation_delay_seconds": 0.0}}
 
 
 class InferenceTests(unittest.TestCase):
@@ -33,8 +35,20 @@ class InferenceTests(unittest.TestCase):
         self.config = NodeConfig.model_validate({**BASE_CONFIG, "inference": INFERENCE})
         self.state = TransportState(self.config, clock=lambda: self.now)
         self.state.model_loaded("cpu")
-        self.state.receive_frame(Image.new("RGB", (64, 48)), self.now)
+        self.refresh()
+        self.state.receive_command(ControlCommand(type="start"))
+        self.refresh()
+
+    def refresh(self, size=(64, 48)):
+        """Stopped executor feedback, then a new frame and heartbeat to observe."""
+        report_stopped(self.state)
+        self.state.receive_frame(Image.new("RGB", size), self.now)
         self.state.receive_command(ControlCommand(type="heartbeat"))
+
+    def restart(self):
+        report_stopped(self.state)
+        self.state.receive_command(ControlCommand(type="start"))
+        self.refresh()
 
     def test_prompt_and_goal_match_demo_tokens(self):
         prompt = build_prompt(self.config.inference)
@@ -56,10 +70,12 @@ class InferenceTests(unittest.TestCase):
         self.assertIsNone(self.state.begin_inference())
         self.state.complete_inference(request, 0.1, lambda: None)
         self.assertIsNone(self.state.begin_inference())
-        self.state.receive_frame(Image.new("RGB", (80, 60)), self.now)
+        report_stopped(self.state)  # Step done; the next cycle needs a new stop and frame.
+        self.assertIsNone(self.state.begin_inference())
+        self.refresh((80, 60))
         self.state.receive_frame(Image.new("RGB", (100, 75)), self.now)
         latest = self.state.begin_inference()
-        self.assertEqual(latest.frame.sequence, 3)
+        self.assertEqual(latest.frame.sequence, request.frame.sequence + 2)
         self.assertEqual(latest.frame.image.size, (100, 75))
 
     def test_stop_start_cannot_publish_old_request(self):
@@ -69,7 +85,7 @@ class InferenceTests(unittest.TestCase):
         self.assertFalse(self.state.snapshot().inference.enabled)
         publish = Mock()
         self.assertFalse(self.state.complete_inference(request, 0.1, publish))
-        self.state.receive_command(ControlCommand(type="start"))
+        self.restart()
         publish.assert_not_called()
         self.assertEqual(self.state.snapshot().inference.discarded, 1)
         self.assertIsNotNone(self.state.begin_inference())
@@ -85,8 +101,7 @@ class InferenceTests(unittest.TestCase):
     def test_fresh_inputs_do_not_make_an_old_source_frame_current(self):
         request = self.state.begin_inference()
         self.now += 6.0
-        self.state.receive_frame(Image.new("RGB", (64, 48)), self.now)
-        self.state.receive_command(ControlCommand(type="heartbeat"))
+        self.refresh()
         publish = Mock()
         self.assertFalse(self.state.complete_inference(request, 6.0, publish))
         publish.assert_not_called()
@@ -96,7 +111,7 @@ class InferenceTests(unittest.TestCase):
         self.state.fail_inference(RuntimeError("test failure"), request)
         self.assertEqual(self.state.snapshot().inference.last_error, "test failure")
         self.assertIsNone(self.state.begin_inference())
-        self.state.receive_command(ControlCommand(type="start"))
+        self.restart()
         request = self.state.begin_inference()
         self.state.request_shutdown()
         self.assertFalse(self.state.complete_inference(request, 0.1, Mock()))
@@ -196,9 +211,12 @@ class InferenceNetworkTests(unittest.TestCase):
                             return state
                     self.fail("State publication stalled")
 
+                resources.enter_context(EchoExecutor(session, config.keys()))
                 loading = await_state(lambda s: s.lifecycle == "loading" and s.camera.fresh)
                 self.assertFalse(loading.inference.model_loaded)
                 load_release.set()
+                await_state(lambda s: s.start_ready)
+                control.put('{"type":"start"}')
                 active = await_state(lambda s: s.inference.active)
                 self.assertTrue(active.inference.model_loaded)
                 self.assertTrue(infer_started.is_set())

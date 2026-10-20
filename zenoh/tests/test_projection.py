@@ -127,14 +127,14 @@ class GroundProjectionTests(unittest.TestCase):
 
 
 class ProjectionDemoTests(unittest.TestCase):
-    def test_saved_result_projects_simulates_and_rejects_mismatched_size(self):
+    def test_saved_result_reports_selection_and_rejects_mismatched_size(self):
         from PIL import Image
 
-        script = Path(__file__).resolve().parents[1] / "projection_demo.py"
+        script = Path(__file__).resolve().parents[1] / "tools/projection_demo.py"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             Image.new("RGB", (320, 240), "gray").save(root / "image.png")
-            (root / "camera.json").write_text(json.dumps(asdict(camera())), encoding="utf-8")
+            (root / "camera.json").write_text(json.dumps(camera().as_json()), encoding="utf-8")
             result = {"inference_id": 1, "frame_sequence": 1, "image_width": 320, "image_height": 240,
                       "coordinate_frame": "image_pixels", "goal_pixels": [190, 160], "prompt": "test",
                       "trajectories": [[[160, 200], [180, 180], [190, 160]]], "generated_texts": ["test"],
@@ -146,22 +146,23 @@ class ProjectionDemoTests(unittest.TestCase):
             completed = subprocess.run(command, text=True, capture_output=True, timeout=30)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             report = json.loads((root / "output/projection_report.json").read_text(encoding="utf-8"))
-            self.assertEqual(report["simulation"]["status"], "reached")
+            self.assertEqual(report["selected_candidate"], 0)
+            self.assertEqual(report["selection_strategy"], "medoid")
             self.assertEqual(report["camera"]["calibration_status"], "assumed")
-            self.assertEqual(report["simulation"]["command"]["vx"], 0)
-            for name in ("projection.png", "simulation.png", "source.png"):
+            for name in ("projection.png", "source.png"):
                 with Image.open(root / "output" / name) as image:
                     image.verify()
-            # A bad selected prefix must not silently fall back to another path.
+            # An unusable fixed choice is reported, never replaced by another path.
             result["trajectories"].append(result["trajectories"][0])
             result["trajectories"][0] = [[160, 100], [160, 200], [190, 160]]
             (root / "result.json").write_text(json.dumps(result), encoding="utf-8")
-            rejected = subprocess.run(command, text=True, capture_output=True, timeout=30)
+            rejected = subprocess.run([*command, "--candidate", "0"], text=True, capture_output=True, timeout=30)
             self.assertEqual(rejected.returncode, 1, rejected.stderr)
             report = json.loads((root / "output/projection_report.json").read_text(encoding="utf-8"))
-            self.assertNotIn("simulation", report)
+            self.assertIsNone(report["selected_candidate"])
             self.assertFalse(report["candidates"][0]["usable"])
-            self.assertFalse((root / "output/simulation.png").exists())
+            medoid = subprocess.run(command, text=True, capture_output=True, timeout=30)
+            self.assertEqual(medoid.returncode, 0, medoid.stderr)
             Image.new("RGB", (640, 480)).save(root / "image.png")
             failed = subprocess.run(command, text=True, capture_output=True, timeout=30)
             self.assertEqual(failed.returncode, 2)

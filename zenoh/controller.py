@@ -9,7 +9,6 @@ obstacle avoidance, pixel projection, freshness checks, or robot communication.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-import json
 import math
 from numbers import Real
 from typing import Literal, Sequence
@@ -186,23 +185,3 @@ class PurePursuitController:
         if abs(curvature) > _EPS:
             speed = min(speed, self.config.max_yaw_rate_rps / abs(curvature))
         return TrackingResult(VelocityCommand(vx=speed, vyaw=speed * curvature), "tracking", **details)
-
-
-def main():
-    """Print sample commands only; no network connection or robot is used."""
-    controller = PurePursuitController()
-    cases = (
-        ("straight", [(0, 0), (2, 0)], Pose2D(0, 0, 0)),
-        ("left", [(0, 0), (2, 1)], Pose2D(0, 0, 0)),
-        ("right", [(0, 0), (2, -1)], Pose2D(0, 0, 0)),
-        ("behind", [(0, 0), (-2, 0)], Pose2D(0, 0, 0)),
-        ("end", [(0, 0), (2, 0)], Pose2D(2, 0, 0)),
-    )
-    for name, path, pose in cases:
-        result = controller.compute(path, pose)
-        print(json.dumps({"case": name, "status": result.status, "target_robot": result.target_robot,
-                          "command": result.command.as_message()}, ensure_ascii=True))
-
-
-if __name__ == "__main__":
-    main()

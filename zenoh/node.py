@@ -1,9 +1,8 @@
-"""Receive camera/Go2 observations and optionally run VAMOS image-path inference."""
+"""Receive camera/Go2 observations and run VAMOS inference in stop-go cycles."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import math
 import os
@@ -23,7 +22,7 @@ import zenoh
 from PIL import Image
 
 from config import (
-    CameraState, CaptureContext, ControlAck, ControlCommand, CycleState, ExecutorState, GoalConfig, Go2NodeState, Go2State, JPEG_ENCODING,
+    CameraState, ControlAck, ControlCommand, CycleState, ExecutorState, GoalConfig, Go2NodeState, Go2State, JPEG_ENCODING,
     JSON_ENCODING, InferenceState, NodeConfig, NodeState, TrajectoryResult, load_node_config,
 )
 
@@ -36,7 +35,6 @@ class ReceivedFrame:
     sequence: int
     received_at: float
     image: Image.Image
-    capture: CaptureContext | None = None
 
 
 @dataclass(frozen=True)
@@ -69,7 +67,7 @@ class TransportState:
             self._rejected["executor"] = 0
         self._stopped = False
         self._shutting_down = False
-        self._inference_enabled = bool(config.inference and config.inference.auto_start)
+        self._inference_enabled = False
         self._session_id = str(uuid4())
         self._goal = config.inference.goal if config.inference else None
         self._goal_revision = 0
@@ -92,7 +90,6 @@ class TransportState:
         self._cycle_id = self._cycle_completed = 0
         self._cycle_inference_id = None
         self._cycle_at = clock()
-        self._capture_after = None
         self._stop_confirmed_at = None
         self._min_cycle_frame = 0
         self._executor = None
@@ -101,7 +98,8 @@ class TransportState:
 
     @property
     def stop_go(self):
-        return bool(self.config.inference and self.config.inference.execution_mode == "stop_go")
+        """Every inference configuration runs stop/observe/infer/move cycles."""
+        return self.config.inference is not None
 
     def _set_cycle_phase(self, phase):
         self._cycle_phase, self._cycle_at = phase, self.clock()
@@ -138,7 +136,6 @@ class TransportState:
                 self._pause("Executor moved during observation/inference; start required.")
             elif self._cycle_phase == "waiting_stop" and state.motion == "stopped":
                 self._min_cycle_frame = 0 if self._frame is None else self._frame.sequence
-                self._capture_after = self.wall_clock()
                 self._stop_confirmed_at = self.clock()
                 self._observation_pose = state.pose
                 self._set_cycle_phase("waiting_image")
@@ -149,10 +146,10 @@ class TransportState:
                 self._cycle_inference_id = None
                 self._set_cycle_phase("waiting_stop")
 
-    def receive_frame(self, image: Image.Image, received_at: float, capture: CaptureContext | None = None) -> None:
+    def receive_frame(self, image: Image.Image, received_at: float) -> None:
         with self._lock:
             sequence = 1 if self._frame is None else self._frame.sequence + 1
-            self._frame = ReceivedFrame(sequence, received_at, image, capture)
+            self._frame = ReceivedFrame(sequence, received_at, image)
 
     def latest_frame(self) -> ReceivedFrame | None:
         """Return an owned copy only while the latest image is still fresh."""
@@ -160,7 +157,7 @@ class TransportState:
             frame = self._frame
             if frame is None or self.clock() - frame.received_at > self.config.camera.frame_freshness_seconds:
                 return None
-            return ReceivedFrame(frame.sequence, frame.received_at, frame.image.copy(), frame.capture)
+            return ReceivedFrame(frame.sequence, frame.received_at, frame.image.copy())
 
     def receive_go2(self, state: Go2NodeState) -> None:
         with self._lock:
@@ -292,31 +289,23 @@ class TransportState:
                 return None
             self._inputs_seen = True
             frame = self._frame
-            if self.stop_go:
-                if self._cycle_phase != "waiting_image" or not self._executor_fresh(self.clock()):
-                    return None
-                # Any camera works: the frame must arrive after stopped feedback
-                # plus the observation delay. Annotated demo frames must also
-                # have been captured after it.
-                capture = frame.capture
-                delay = self.config.inference.stop_go.observation_delay_seconds
-                if (frame.sequence <= self._min_cycle_frame
-                        or frame.received_at < self._stop_confirmed_at + delay):
-                    return None
-                if capture is not None and (capture.captured_at_unix_seconds <= self._capture_after
-                        or capture.captured_at_unix_seconds > self.wall_clock() + 0.25):
-                    return None
+            if self._cycle_phase != "waiting_image" or not self._executor_fresh(self.clock()):
+                return None
+            # The frame must arrive after stopped feedback plus the observation
+            # delay, so camera latency cannot pass off a pre-stop image.
+            delay = self.config.inference.stop_go.observation_delay_seconds
+            if frame.sequence <= self._min_cycle_frame or frame.received_at < self._stop_confirmed_at + delay:
+                return None
             identity = (self._epoch, frame.sequence)
             if identity == self._last_input:
                 return None
             self._last_input = identity
             self._request_id += 1
             self._active = True
-            if self.stop_go:
-                self._set_cycle_phase("inferencing")
+            self._set_cycle_phase("inferencing")
             return InferenceRequest(self._request_id, self._epoch,
-                                    ReceivedFrame(frame.sequence, frame.received_at, frame.image.copy(), frame.capture),
-                                    self._goal, self._goal_revision, self._cycle_id if self.stop_go else None)
+                                    ReceivedFrame(frame.sequence, frame.received_at, frame.image.copy()),
+                                    self._goal, self._goal_revision, self._cycle_id)
 
     def complete_inference(self, request: InferenceRequest, duration: float, publish: Callable[[], None]) -> bool:
         # Serialize the final acceptance/publication with stop commands. A stopped
@@ -326,23 +315,20 @@ class TransportState:
             self._last_duration = duration
             self._last_inference_frame = request.frame.sequence
             status = self.snapshot()
+            # The executor holds still from observation to result, so the frame
+            # stays valid for the whole stopped inference budget.
             age = self.clock() - request.frame.received_at
-            # This longer budget applies only to the stopped static-image demo.
-            # Continuous operation retains its original source-age limit.
-            age_limit = (self.config.inference.stop_go.inference_timeout_seconds if self.stop_go
-                         else self.config.inference.max_frame_age_seconds)
             if (self._shutting_down or self._stopped or not self._inference_enabled
                     or request.epoch != self._epoch or not status.camera.fresh or not status.cli_connected
-                    or age > age_limit):
+                    or age > self.config.inference.stop_go.inference_timeout_seconds):
                 self._discarded += 1
-                if self.stop_go and self._inference_enabled:
+                if self._inference_enabled:
                     self._pause("Inference result expired; start required.")
                 return False
             publish()
             self._completed += 1
-            if self.stop_go:
-                self._cycle_inference_id = request.inference_id
-                self._set_cycle_phase("moving")
+            self._cycle_inference_id = request.inference_id
+            self._set_cycle_phase("moving")
             return True
 
     def fail_inference(self, error: Exception, request: InferenceRequest | None = None) -> None:
@@ -375,11 +361,10 @@ class TransportState:
             extra = {} if self.config.inference is None else {"stage": "inference"}
             state = NodeState(
                 **extra,
-                cycle=CycleState(mode="stop_go" if self.stop_go else "continuous", phase=self._cycle_phase,
+                cycle=CycleState(phase=self._cycle_phase,
                     cycle_id=self._cycle_id, completed=self._cycle_completed, inference_id=self._cycle_inference_id,
                     executor_fresh=self._executor_fresh(now),
-                    executor_motion=self._executor.motion if self._executor_fresh(now) else None,
-                    capture_after_unix_seconds=self._capture_after),
+                    executor_motion=self._executor.motion if self._executor_fresh(now) else None),
                 node_session_id=self._session_id, control_epoch=self._epoch,
                 goal=self._goal, goal_revision=self._goal_revision, last_control_ack=self._last_ack,
                 lifecycle=lifecycle,
@@ -414,7 +399,7 @@ class TransportState:
                 blocker = blocker or "inference is busy or shutting down"
             ready = not self._inference_enabled and blocker is None
             if self._inference_enabled:
-                message = "Running stop/observe/infer/move cycles." if self.stop_go else "Running inference."
+                message = "Running stop/observe/infer/move cycles."
             else:
                 message = "Ready; send start." if ready else f"Not ready: {blocker}."
                 if self._pause_reason:
@@ -466,7 +451,6 @@ class NodeRuntime:
                         generated_texts=output.generated_texts, device=output.device,
                         duration_seconds=duration,
                         source_age_seconds=max(0.0, self.state.clock() - request.frame.received_at),
-                        capture=request.frame.capture,
                     )
                     preview = render_preview(request.frame.image, result)
 
@@ -495,22 +479,11 @@ class NodeRuntime:
             return  # Skip overlapping frames rather than building a backlog.
         received_at = self.state.clock()
         try:
-            attachment = getattr(sample, "attachment", None)
-            capture = None
-            if attachment is not None:
-                try:
-                    metadata = json.loads(attachment.to_bytes())
-                except (ValueError, UnicodeDecodeError):
-                    metadata = None
-                # Attachments from independently versioned camera nodes may use
-                # other formats. Only this explicitly tagged demo schema is ours.
-                if isinstance(metadata, dict) and metadata.get("kind") == "static_image_demo":
-                    capture = CaptureContext.model_validate(metadata)
             with Image.open(BytesIO(sample.payload.to_bytes())) as source:
                 if source.format != "JPEG":
                     raise ValueError("camera payload is not a JPEG")
                 image = source.convert("RGB")
-            self.state.receive_frame(image, received_at, capture)
+            self.state.receive_frame(image, received_at)
         except (OSError, ValueError, Image.DecompressionBombError) as error:
             self.state.reject("camera")
             LOGGER.warning("Rejected camera image: %s", error)

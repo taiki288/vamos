@@ -82,24 +82,19 @@ class StopGoConfig(Settings):
 
 
 class InferenceConfig(Settings):
-    execution_mode: Literal["continuous", "stop_go"] = "continuous"
     stop_go: StopGoConfig = Field(default_factory=StopGoConfig)
-    auto_start: StrictBool = False
     model_key: Annotated[StrictStr, Field(min_length=1)] = "mateoguaman/vamos"
     device: Literal["auto", "cuda", "cpu"] = "cuda"
     num_samples: Annotated[int, Field(strict=True, ge=1, le=50)] = 10
     max_new_tokens: Annotated[int, Field(strict=True, ge=2, le=128)] = 10
     temperature: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.05
     disable_compile: StrictBool = True
-    frequency_hz: PositiveSeconds = 1.0
-    max_frame_age_seconds: PositiveSeconds = 5.0
+    frequency_hz: PositiveSeconds = 1.0  # How often the worker checks for an observation to infer.
     shutdown_timeout_seconds: PositiveSeconds = 30.0
     goal: GoalConfig
 
     @model_validator(mode="after")
     def generation_settings(self) -> InferenceConfig:
-        if self.execution_mode == "stop_go" and self.auto_start:
-            raise ValueError("stop-go cycles require an explicit operator start")
         if self.temperature == 0 and self.num_samples != 1:
             raise ValueError("greedy decoding requires num_samples=1")
         if self.max_new_tokens % 2:
@@ -216,14 +211,12 @@ class InferenceState(Settings):
 
 
 class CycleState(Settings):
-    mode: Literal["continuous", "stop_go"] = "continuous"
     phase: Literal["paused", "waiting_stop", "waiting_image", "inferencing", "moving"] = "paused"
     cycle_id: int = 0
     completed: int = 0
     inference_id: int | None = None
     executor_fresh: bool = False
     executor_motion: Literal["stopped", "moving", "settling", "error"] | None = None
-    capture_after_unix_seconds: float | None = None
 
 
 class NodeState(Settings):
@@ -236,7 +229,7 @@ class NodeState(Settings):
     stage: Literal["transport", "inference"] = "transport"
     lifecycle: Literal["loading", "idle", "running", "paused", "error", "stopping", "stopped"]
     start_ready: bool = False
-    status_message: str = "Transport only; inference and robot commands are not implemented."
+    status_message: str = "Transport diagnostics only; no inference configured."
     cli_connected: bool
     received_commands: int
     last_command: str | None
@@ -247,38 +240,27 @@ class NodeState(Settings):
 
 
 FinitePixel = Annotated[float, Field(allow_inf_nan=False)]
+FiniteFloat = FinitePixel
 
 
-class CapturePose(Settings):
-    x: FinitePixel = 0.0
-    y: FinitePixel = 0.0
-    yaw: FinitePixel = 0.0
+class PlanarPose(Settings):
+    x: FiniteFloat = 0.0
+    y: FiniteFloat = 0.0
+    yaw: FiniteFloat = 0.0
 
 
 class ExecutorState(Settings):
-    # "stop_go_simulator": the ideal 2D executor, never a hardware claim.
-    # "go2": go2_executor.py, whose "stopped" is confirmed by Go2 observations
-    # and whose pose is dead-reckoned from its own commands.
-    kind: Literal["stop_go_simulator", "go2"] = "stop_go_simulator"
+    # Published by go2_executor.py. "stopped" is confirmed by Go2 observations;
+    # pose and path are dead-reckoned from the executor's own commands.
     executor_session_id: Annotated[StrictStr, Field(min_length=1, max_length=64)]
     node_session_id: Annotated[StrictStr, Field(min_length=1, max_length=64)]
     control_epoch: Annotated[int, Field(strict=True, ge=0)]
     cycle_id: Annotated[int, Field(strict=True, ge=0)]
     motion: Literal["stopped", "moving", "settling", "error"]
     inference_id: int | None = None
-    pose: CapturePose
+    pose: PlanarPose
+    path_m: list[tuple[FiniteFloat, FiniteFloat]] = []  # Current step's ground path, same frame as pose.
     message: str = ""
-
-
-class CaptureContext(Settings):
-    # Demo-only pose annotation. Ordinary camera JPEGs need no attachment and
-    # still support image inference, but cannot drive the streaming simulator.
-    kind: Literal["static_image_demo"] = "static_image_demo"
-    source_id: Annotated[StrictStr, Field(min_length=1, max_length=128)]
-    frame_id: Annotated[int, Field(strict=True, ge=0)]
-    captured_at_unix_seconds: Annotated[float, Field(gt=0, allow_inf_nan=False)]
-    world_frame: Literal["static_demo_world"] = "static_demo_world"
-    pose: CapturePose = Field(default_factory=CapturePose)
 
 
 class TrajectoryResult(Settings):
@@ -299,7 +281,6 @@ class TrajectoryResult(Settings):
     duration_seconds: float
     source_age_seconds: float
     device: str
-    capture: CaptureContext | None = None
 
     @model_validator(mode="after")
     def valid_paths(self) -> TrajectoryResult:

@@ -25,6 +25,8 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from projection import GroundCamera, GroundProjector
 
 Point2D = tuple[float, float]

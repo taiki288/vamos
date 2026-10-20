@@ -37,8 +37,8 @@ from pydantic import Field, StrictBool, StrictStr, model_validator
 import zenoh
 
 from config import (
-    CapturePose, ControlCommand, ExecutorState, Go2NodeState, JSON_ENCODING, NodeConfig, NodeState,
-    PositiveSeconds, Settings, StopGoConfig, TrajectoryResult, load_node_config,
+    ControlCommand, ExecutorState, Go2NodeState, JSON_ENCODING, NodeConfig, NodeState,
+    PlanarPose, PositiveSeconds, Settings, StopGoConfig, TrajectoryResult, load_node_config,
 )
 from controller import Pose2D, PurePursuitConfig, PurePursuitController, VelocityCommand
 from projection import GroundCamera, GroundProjector, path_to_world
@@ -213,7 +213,7 @@ class Go2StepExecutor:
     def _node_running(self, now):
         node = self.node
         return (node is not None and now - self.node_at <= self.config.node_state_timeout_seconds
-                and node.inference.enabled and node.cycle.mode == "stop_go"
+                and node.inference.enabled
                 and node.lifecycle not in ("error", "stopping", "stopped")
                 and (node.node_session_id, node.control_epoch) != self._stopped_epoch)
 
@@ -436,11 +436,13 @@ class Go2StepExecutor:
             motion, message = "error", "Go2 state is stale, disconnected or not accepting commands"
         else:
             motion, message = "settling", self.phase
-        return ExecutorState(kind="go2", executor_session_id=self.session_id,
+        return ExecutorState(executor_session_id=self.session_id,
                              node_session_id=node.node_session_id, control_epoch=node.control_epoch,
                              cycle_id=node.cycle.cycle_id, motion=motion,
                              inference_id=self._executed if self.phase == "settling" else None,
-                             pose=CapturePose(**asdict(self.pose)), message=message or "")
+                             pose=PlanarPose(**asdict(self.pose)),
+                             path_m=list(self._step.path) if self._step is not None else [],
+                             message=message or "")
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -530,8 +532,8 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     try:
         node_config = load_node_config(args.node_config)
-        if node_config.inference is None or node_config.inference.execution_mode != "stop_go":
-            raise ValueError("the Go2 executor requires a node config with inference.execution_mode stop_go")
+        if node_config.inference is None:
+            raise ValueError("the Go2 executor requires a node config with an inference section")
         config = load_executor_config(args.executor_config)
         camera = load_camera(config, args.executor_config)
         executor = Go2StepExecutor(config, node_config.inference.stop_go, camera)

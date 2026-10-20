@@ -13,8 +13,8 @@ the camera and robot bridges are separate projects:
 > [!WARNING]
 > `go2_executor.py` moves a real robot. Validate robot-free first, support the
 > Go2 for the first powered trials, keep the remote at hand and agree on an
-> emergency stop beforehand. Run exactly one executor and never run the
-> diagnostic peer's `--fake-go2-state` next to a real robot.
+> emergency stop beforehand. Run exactly one executor, and never run
+> `tools/fake_go2.py` or `tools/demo-executor-config.json5` with a real robot.
 
 ## Components
 
@@ -23,22 +23,31 @@ the camera and robot bridges are separate projects:
 | `node.py` | Receives camera/Go2/operator input, runs VAMOS, coordinates stop-go cycles, publishes `vamos/state`, results and previews | no |
 | `cli.py` | Operator prompt and heartbeat; optionally launches a local robot-free demo | no |
 | `go2_executor.py` | Executes authorized steps on the Go2: stand, bounded velocity, down | **yes** |
-| `stream_simulator.py` | Robot-free 2D executor for the same protocol (static image demo) | no |
-| `diagnostic_peer.py` | Test JPEG source; heartbeat and fake Go2 state only when asked | no |
-| `viewer.py` | Shows `vamos/preview` | no |
-| `calibrate_camera.py` | Camera intrinsics, mount and verification for ground projection | no |
-| `projection_demo.py`, `simulator.py`, `controller.py` | Offline projection/path-following tools | no |
+
+Libraries: `config.py` (settings and wire models), `inference.py` (VAMOS
+adapter), `projection.py` (pixels → ground), `selection.py` (candidate choice),
+`controller.py` (Pure Pursuit), `launcher.py` (CLI-managed processes).
+
+Development and setup tools live in `tools/`:
+
+| Tool | Role |
+| --- | --- |
+| `tools/fake_camera.py` | Publishes one test image as the camera stream |
+| `tools/fake_go2.py` | Simulated Go2 node (same Zenoh contract) with an optional 2D view |
+| `tools/viewer.py` | Shows `vamos/preview` |
+| `tools/calibrate_camera.py` | Camera intrinsics, mount and verification for ground projection |
+| `tools/projection_demo.py` | One saved or live inference projected to the ground, with the executor's selection |
 
 | Key | Encoding | Publisher → subscribers |
 | --- | --- | --- |
 | `camera/front` | `image/jpeg` | camera node → node |
 | `unitree/go2/state` | `application/json` | Go2 node → node, executor |
 | `unitree/go2/command` | `application/json` | **executor** → Go2 node |
-| `vamos/command` | `application/json` (`heartbeat`, `start`, `stop`, `goal`) | CLI → node, executor, simulator |
-| `vamos/state` | `application/json` | node → CLI, executor, simulator |
-| `vamos/trajectories` | `application/json` pixel paths + metadata | node → executor, simulator |
+| `vamos/command` | `application/json` (`heartbeat`, `start`, `stop`, `goal`) | CLI → node, executor |
+| `vamos/state` | `application/json` | node → CLI, executor |
+| `vamos/trajectories` | `application/json` pixel paths + metadata | node → executor |
 | `vamos/preview` | `image/jpeg` | node → viewer |
-| `vamos/executor/state` | `application/json` stop/move feedback | executor or simulator → node |
+| `vamos/executor/state` | `application/json` stop/move feedback and current step path | executor → node |
 
 All keys are concrete (no wildcards) and configurable. Every runtime file named
 `zenoh/*.json5` / `zenoh/ground-camera.json` is ignored by Git; copy the tracked
@@ -53,16 +62,19 @@ uv sync --group zenoh
 uv run --group zenoh python zenoh/cli.py --demo --viewer --simulator
 ```
 
-This starts the inference node, a test image source (with a fake resting Go2
-state), the preview viewer and the 2D stop-go simulator. Enter `status`, then
-`start` once `model_loaded=True` and `start_ready=True`. `quit`, EOF or Ctrl+C
-stops inference and closes only the processes this CLI started; their logs are
-under `outputs/cli` (`logs`, `processes`).
+This starts the inference node, a test camera, a simulated Go2 (window with
+`--simulator`), the **real** `go2_executor.py` with
+`tools/demo-executor-config.json5`, and the preview viewer. Enter `status`, then
+`start` once `model_loaded=True` and `start_ready=True`: the executor stands the
+simulated Go2, runs one bounded step per inference and lays it down on `stop`.
+`quit`, EOF or Ctrl+C stops inference and closes only the processes this CLI
+started (the executor first, so it can rest the robot); their logs are under
+`outputs/cli` (`logs`, `processes`).
 
 Use `--node-config zenoh/ground-inference-node-config.example.json5 --image
-test_images/texas_ground.jpg` for the second bundled image. The demo reuses one
-static image at every simulated stop pose: it tests scheduling and short-step
-control, not perception, metric accuracy or obstacle clearance.
+test_images/texas_ground.jpg` for the second bundled image. The camera image
+never changes as the simulated robot moves: the demo exercises the protocol,
+selection and executor, not perception, metric accuracy or obstacle clearance.
 
 The inference examples require CUDA and the `mateoguaman/vamos` weights
 (`device: cuda` fails explicitly instead of falling back to CPU).
@@ -93,14 +105,14 @@ Processes, each from the repository root (copy the example configs first):
 uv run --group zenoh python zenoh/node.py --node-config zenoh/inference-node-config.json5 --zenoh-config zenoh/zenoh-config.json5
 uv run --group zenoh python zenoh/go2_executor.py --node-config zenoh/inference-node-config.json5 --executor-config zenoh/go2-executor-config.json5 --zenoh-config zenoh/peer-zenoh-config.json5
 uv run --group zenoh python zenoh/cli.py --attach --node-config zenoh/inference-node-config.json5 --zenoh-config zenoh/peer-zenoh-config.json5
-uv run --group zenoh python zenoh/viewer.py
+uv run --group zenoh python zenoh/tools/viewer.py
 ```
 
 The executor reads the node config for keys and step bounds, and its own
 `go2-executor-config.json5` for calibration, candidate selection, speeds and
 timeouts. It refuses a calibration that is not `calibrated` unless
 `allow_assumed_calibration: true` (robot-free tests only), and refuses a node
-config that is not in stop-go mode. For several computers, edit the
+config without an `inference` section. For several computers, edit the
 listen/connect endpoints so every process reaches the node's listener.
 
 ## Operator CLI
@@ -118,8 +130,8 @@ listen/connect endpoints so every process reaches the node's listener.
 
 The CLI sends heartbeat every 0.2 s independently of terminal input and
 confirms operations by request IDs echoed in node state. Without `--attach` it
-starts a local node; `--demo`, `--viewer` and `--simulator` add robot-free
-helpers. It never starts the Go2 executor. A timeout or disconnected node is
+starts a local node; `--demo` (optionally with `--simulator`) and `--viewer`
+add robot-free helpers. Outside `--demo` it never starts the Go2 executor. A timeout or disconnected node is
 reported as unconfirmed, never as a successful stop.
 
 ## Stop / observe / infer / move
@@ -187,11 +199,11 @@ Image sizes must match exactly; intrinsics are never rescaled silently.
 
 ```console
 # 1. Intrinsics/distortion from 15-30 checkerboard photos at the inference resolution
-uv run --group zenoh python zenoh/calibrate_camera.py intrinsics --images calib/ --board 9x6 --square-m 0.025 --model fisheye --base zenoh/ground-camera.example.json --output zenoh/ground-camera.json
+uv run --group zenoh python zenoh/tools/calibrate_camera.py intrinsics --images calib/ --board 9x6 --square-m 0.025 --model fisheye --base zenoh/ground-camera.example.json --output zenoh/ground-camera.json
 # 2. Mount from >= 4 non-collinear floor markers (CSV: u,v,x_m,y_m in the robot frame)
-uv run --group zenoh python zenoh/calibrate_camera.py mount --camera zenoh/ground-camera.json --markers mount-markers.csv --output zenoh/ground-camera.json
+uv run --group zenoh python zenoh/tools/calibrate_camera.py mount --camera zenoh/ground-camera.json --markers mount-markers.csv --output zenoh/ground-camera.json
 # 3. Verify with different markers; marks the file calibrated only within tolerance
-uv run --group zenoh python zenoh/calibrate_camera.py verify --camera zenoh/ground-camera.json --markers check-markers.csv --tolerance-m 0.10 --mark-calibrated zenoh/ground-camera.json
+uv run --group zenoh python zenoh/tools/calibrate_camera.py verify --camera zenoh/ground-camera.json --markers check-markers.csv --tolerance-m 0.10 --mark-calibrated zenoh/ground-camera.json
 ```
 
 Use `fisheye` for wide-angle lenses unless the camera node already publishes
@@ -223,7 +235,6 @@ Node (`*inference-node-config.example.json5`):
 | --- | --- |
 | `camera.frame_freshness_seconds`, `cli_heartbeat_timeout_seconds` | Input freshness; expiry pauses the run |
 | `go2.node_state_timeout_seconds` | Go2 freshness shown in node state |
-| `inference.execution_mode` | `stop_go` for robots; `continuous` is inference-only (see below) |
 | `inference.num_samples`, `max_new_tokens`, `temperature`, `disable_compile` | VAMOS generation |
 | `inference.goal` | Default goal (image fractions, quantized to VAMOS location tokens) and instruction |
 | `inference.stop_go.max_step_seconds` / `max_step_distance_m` / `max_step_yaw_rad` | Step bounds |
@@ -238,18 +249,11 @@ Executor (`go2-executor-config.example.json5`): `camera_calibration`,
 `shutdown_timeout_seconds`, `go2.{state,stand,down}_timeout_seconds`, and
 `motion` (Pure Pursuit speeds, lookahead, tolerances).
 
-## Continuous mode and offline tools
+## Offline tools
 
-`execution_mode: "continuous"` streams the newest frame through inference at
-`frequency_hz` without stopping, with `max_frame_age_seconds` limiting result
-age. It is kept for inference/transport experiments and its tests; the Go2
-executor refuses it, and with multi-second inference it cannot drive a robot
-safely. `stream_simulator.py` can follow its results in the static-image 2D
-view.
-
-- `projection_demo.py --infer` saves one real inference with its ground
-  projection; `--result ... --image ...` replays it without a GPU.
-- `simulator.py` runs the Pure Pursuit controller on synthetic metric paths.
+- `tools/projection_demo.py --infer` runs one real inference and shows every
+  candidate on the ground with the executor's selection;
+  `--result ... --image ...` replays a saved result without a GPU.
 - `node.py` without an `inference` section is a transport diagnostic.
 
 ## Tests
@@ -258,9 +262,10 @@ view.
 uv run --group zenoh python -m unittest discover -s zenoh/tests -v
 ```
 
-Tests use fake inference engines and a fake Go2 (posture transitions, motion
-following velocity); the executor tests drive the real node state machine.
-Separate-process localhost tests exercise Zenoh transport. GPU inference,
+Tests use fake inference engines and the same simulated Go2 as the demo; the
+executor tests drive the real node state machine, and one TCP test runs node,
+executor, simulated Go2 and CLI together. Separate-process localhost tests
+exercise Zenoh transport. GPU inference,
 Jetson performance, the real Go2 node and camera calibration with a physical
 camera are not covered and must be checked as described above.
 
@@ -274,7 +279,8 @@ freshness window, so streaming inference disables compilation by default
 at that hub directory under `/mnt/c`; `HF_HUB_OFFLINE=1` and
 `TRANSFORMERS_OFFLINE=1` then verify cache-only inference.
 
-Validated before the Go2 executor was added: Ubuntu 24.04 under WSL2 x86_64 with
+On Windows with an RTX 5060, `cli.py --demo` ran the real model, executor and
+simulated Go2 for 15 stop-go cycles (about 0.7 s per inference). Earlier, before the Go2 executor: Ubuntu 24.04 under WSL2 x86_64 with
 an RTX 5060 (Python 3.11.17, Torch 2.13.0+cu130) ran real 10-path inference,
 projection and 2D following, including WSLg windows. Jetson/aarch64 and
 physical Go2 operation have not been validated.

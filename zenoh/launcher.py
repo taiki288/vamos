@@ -110,7 +110,7 @@ class ManagedProcesses:
                         f"PID={child.process.pid} log={child.log}")
 
     def check_required(self):
-        for name in ("node", "source"):
+        for name in ("node", "camera", "go2", "executor"):
             child = self.children.get(name)
             if child is not None and child.process.poll() is not None:
                 raise RuntimeError(f"{name} exited with code {child.process.returncode}; see {child.log}")
@@ -121,12 +121,20 @@ class ManagedProcesses:
         self.output("\n".join(self.children[name].log.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]))
 
     def close(self):
-        # Request every owned process to stop before waiting for the slow model.
+        deadline = time.monotonic() + self.shutdown_timeout
+        # The executor rests the (simulated) robot first, which needs Go2 state.
+        executor = self.children.get("executor")
+        if executor is not None and executor.process.poll() is None:
+            executor.stop_file.touch()
+            try:
+                executor.process.wait(max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass  # Terminated with the others below.
+        # Request every other owned process to stop before waiting for the slow model.
         # Cooperative shutdown also reaches Windows venv redirector children.
         for child in self.children.values():
             if child.process.poll() is None:
                 child.stop_file.touch()
-        deadline = time.monotonic() + self.shutdown_timeout
         for name, child in reversed(list(self.children.items())):
             try:
                 child.process.wait(max(0.0, deadline - time.monotonic()))
