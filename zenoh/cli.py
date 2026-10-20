@@ -338,7 +338,8 @@ def main() -> int:
                                 "--zenoh-config", args.node_zenoh_config.resolve())
                 processes.wait_for_listener(addresses)
             if args.demo:
-                source_args = [*shared, "--peer-config", args.peer_config.resolve(), "--no-heartbeat"]
+                # The CLI owns heartbeat; the robot-free demo needs the fake Go2 state.
+                source_args = [*shared, "--peer-config", args.peer_config.resolve(), "--fake-go2-state"]
                 if args.image:
                     source_args.extend(("--image", args.image.resolve()))
                 processes.start("source", HERE / "diagnostic_peer.py", *source_args)

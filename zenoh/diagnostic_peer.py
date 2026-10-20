@@ -1,4 +1,9 @@
-"""Publish a test image, simulated Go2 state, and heartbeat; display VAMOS state."""
+"""Publish a test image and display VAMOS state.
+
+Heartbeat and a simulated (resting) Go2 state are opt-in: a second heartbeat
+source hides operator-CLI loss, and a fake Go2 state on the real Go2 key would
+contradict the robot's observations. Never use --fake-go2-state with a robot.
+"""
 
 from __future__ import annotations
 
@@ -39,7 +44,11 @@ def main() -> int:
     parser.add_argument("--peer-config", type=Path, default=HERE / "diagnostic-peer-config.example.json5")
     parser.add_argument("--zenoh-config", type=Path, default=HERE / "peer-zenoh-config.example.json5")
     parser.add_argument("--image", type=Path, help="Override the fixture image (relative to working directory)")
-    parser.add_argument("--no-heartbeat", action="store_true", help="Let the operator CLI own heartbeat liveness")
+    parser.add_argument("--heartbeat", action="store_true",
+                        help="Also send operator heartbeat (only when no CLI is running)")
+    parser.add_argument("--no-heartbeat", action="store_true", help=argparse.SUPPRESS)  # Former default.
+    parser.add_argument("--fake-go2-state", action="store_true",
+                        help="Also publish a SIMULATED resting Go2 state; never with a real robot")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     try:
@@ -87,8 +96,10 @@ def main() -> int:
             camera = resources.enter_context(session.declare_publisher(keys["camera"], encoding=JPEG_ENCODING))
             go2 = resources.enter_context(session.declare_publisher(keys["go2_state"], encoding=JSON_ENCODING))
             control = resources.enter_context(session.declare_publisher(keys["command"], encoding=JSON_ENCODING))
-            logging.info("Sending %s + SIMULATED Go2 state%s. Ctrl+C to stop.", image_path.name,
-                         " (heartbeat supplied by CLI)" if args.no_heartbeat else " + heartbeat")
+            heartbeat = args.heartbeat and not args.no_heartbeat
+            logging.info("Sending %s%s%s. Ctrl+C to stop.", image_path.name,
+                         " + SIMULATED Go2 state" if args.fake_go2_state else "",
+                         " + heartbeat" if heartbeat else " (heartbeat supplied by the CLI)")
             next_report = 0.0
             source_id, frame_id = str(uuid4()), 0
             period = 1.0 / peer.publish_frequency_hz
@@ -98,8 +109,9 @@ def main() -> int:
                 capture = CaptureContext(source_id=source_id, frame_id=frame_id,
                                          captured_at_unix_seconds=time.time())
                 camera.put(jpeg, attachment=capture.model_dump_json().encode("utf-8"))
-                go2.put(fake_go2)
-                if not args.no_heartbeat:
+                if args.fake_go2_state:
+                    go2.put(fake_go2)
+                if heartbeat:
                     control.put('{"type":"heartbeat"}')
                 now = time.monotonic()
                 if now >= next_report:

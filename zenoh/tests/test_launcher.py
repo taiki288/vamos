@@ -36,7 +36,8 @@ class LauncherTests(unittest.TestCase):
                     if call.args[0] == "node":
                         self.assertIn(HERE / "inference-node-config.example.json5", call.args)
                     if call.args[0] == "source":
-                        self.assertIn("--no-heartbeat", call.args)
+                        self.assertIn("--fake-go2-state", call.args)
+                        self.assertNotIn("--heartbeat", call.args)
                     if call.args[0] == "simulator":
                         self.assertEqual("--headless" in call.args, "--simulator" not in flags)
                 runtime.return_value.run.assert_called_once()
@@ -82,7 +83,7 @@ class LauncherTests(unittest.TestCase):
                     check_listener_available(addresses)
                     manager.start("node", HERE / "node.py", "--zenoh-config", server)
                     manager.wait_for_listener(addresses)
-                    manager.start("source", HERE / "diagnostic_peer.py", "--zenoh-config", client, "--no-heartbeat")
+                    manager.start("source", HERE / "diagnostic_peer.py", "--zenoh-config", client, "--fake-go2-state")
                     operator = CliRuntime(NodeConfig.model_validate(BASE_CONFIG), output=lambda _: None)
                     with operator.connect(zenoh.Config.from_file(str(client))):
                         state = operator.cache.wait(lambda s: s.camera.fresh and s.go2.fresh, 8)
