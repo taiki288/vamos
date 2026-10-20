@@ -256,8 +256,10 @@ class CapturePose(Settings):
 
 
 class ExecutorState(Settings):
-    # Feedback from the local ideal 2D executor, never a Go2 hardware claim.
-    kind: Literal["stop_go_simulator"] = "stop_go_simulator"
+    # "stop_go_simulator": the ideal 2D executor, never a hardware claim.
+    # "go2": go2_executor.py, whose "stopped" is confirmed by Go2 observations
+    # and whose pose is dead-reckoned from its own commands.
+    kind: Literal["stop_go_simulator", "go2"] = "stop_go_simulator"
     executor_session_id: Annotated[StrictStr, Field(min_length=1, max_length=64)]
     node_session_id: Annotated[StrictStr, Field(min_length=1, max_length=64)]
     control_epoch: Annotated[int, Field(strict=True, ge=0)]
