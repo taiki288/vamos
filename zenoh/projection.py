@@ -1,8 +1,10 @@
-"""Rectified pinhole pixels -> flat ground in the image-capture robot frame.
+"""Camera pixels -> flat ground in the image-capture robot frame.
 
 Uses the same ray/plane intersection as Projector.pixels_to_ground in the
 original trajectory_projection package, with explicit axes and invalid-ray
-handling. No depth, ROS, Zenoh, model or robot connection is required.
+handling. Pixels from a distorted lens are first undistorted with the OpenCV
+pinhole ("opencv") or equidistant ("fisheye") model. No depth, ROS, Zenoh,
+model or robot connection is required.
 """
 
 from __future__ import annotations
@@ -20,6 +22,9 @@ from controller import Pose2D
 Point2D = tuple[float, float]
 ProjectionStatus = Literal["ok", "invalid_pixel", "outside_image", "not_ground_facing",
                            "behind_robot", "out_of_range"]
+DistortionModel = Literal["none", "opencv", "fisheye"]
+# cv2.calibrateCamera returns 4, 5, 8, 12 or 14 coefficients; fisheye uses k1..k4.
+_OPENCV_COEFFICIENT_COUNTS = (4, 5, 8, 12, 14)
 
 
 def _finite(value: float, name: str) -> float:
@@ -30,12 +35,14 @@ def _finite(value: float, name: str) -> float:
 
 @dataclass(frozen=True)
 class GroundCamera:
-    """Image dimensions must match the rectified image used for inference.
+    """Image dimensions must match the image used for inference.
 
     Optical frame: right/down/forward. Robot: forward/left/up. Zero pitch and
     yaw mean a level, forward-facing camera with no roll. Positive pitch tilts
     down; positive yaw turns left. Offsets and height locate the optical centre
     relative to the ground-projected robot origin. Ground is z=0.
+    The distortion model/coefficients describe the inference image itself;
+    "none" means it is already rectified.
     """
 
     image_width: int
@@ -51,6 +58,8 @@ class GroundCamera:
     left_offset_m: float = 0.0
     max_distance_m: float = 8.0
     max_segment_length_m: float = 3.0
+    distortion_model: DistortionModel = "none"
+    distortion_coefficients: tuple[float, ...] = ()
     calibration_status: Literal["assumed", "calibrated"] = "assumed"
     notes: str = ""
 
@@ -72,6 +81,19 @@ class GroundCamera:
             raise ValueError("pitch must be in (-89, 89), yaw in [-180, 180] degrees")
         if self.calibration_status not in ("assumed", "calibrated") or not isinstance(self.notes, str):
             raise ValueError("invalid calibration metadata")
+        coefficients = tuple(_finite(value, "distortion coefficient") for value in self.distortion_coefficients)
+        object.__setattr__(self, "distortion_coefficients", coefficients)
+        expected = {"none": (0,), "opencv": _OPENCV_COEFFICIENT_COUNTS, "fisheye": (4,)}.get(self.distortion_model)
+        if expected is None:
+            raise ValueError("distortion_model must be none, opencv or fisheye")
+        if len(coefficients) not in expected:
+            raise ValueError(f"{self.distortion_model} distortion needs {' or '.join(map(str, expected))} coefficients")
+
+    @property
+    def matrix(self):
+        import numpy as np
+
+        return np.array([[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1]], dtype=float)
 
     def check_image_size(self, width: int, height: int):
         if (width, height) != (self.image_width, self.image_height):
@@ -80,7 +102,13 @@ class GroundCamera:
 
     @classmethod
     def load(cls, path: Path) -> GroundCamera:
-        return cls(**json.loads(path.read_text(encoding="utf-8")))
+        values = json.loads(path.read_text(encoding="utf-8"))
+        if "distortion_coefficients" in values:
+            values["distortion_coefficients"] = tuple(values["distortion_coefficients"])
+        return cls(**values)
+
+    def as_json(self) -> dict:
+        return {**asdict(self), "distortion_coefficients": list(self.distortion_coefficients)}
 
 
 @dataclass(frozen=True)
@@ -117,6 +145,55 @@ class GroundProjector:
         self.cp, self.sp = math.cos(pitch), math.sin(pitch)
         self.cy, self.sy = math.cos(yaw), math.sin(yaw)
 
+    def normalized_ray(self, u: float, v: float) -> Point2D:
+        """K^-1 [u, v, 1] after removing lens distortion."""
+        c = self.camera
+        if c.distortion_model == "none":
+            return (u - c.cx) / c.fx, (v - c.cy) / c.fy
+        import cv2
+        import numpy as np
+
+        source = np.array([[[u, v]]], dtype=float)
+        coefficients = np.array(c.distortion_coefficients, dtype=float)
+        if c.distortion_model == "fisheye":
+            result = cv2.fisheye.undistortPoints(source, c.matrix, coefficients)
+        else:
+            result = cv2.undistortPoints(source, c.matrix, coefficients)
+        return float(result[0, 0, 0]), float(result[0, 0, 1])
+
+    def rotation_optical_from_robot(self):
+        """Rows are the optical right/down/forward axes in the robot FLU frame."""
+        import numpy as np
+
+        cp, sp, cy, sy = self.cp, self.sp, self.cy, self.sy
+        return np.array([[sy, -cy, 0.0], [-sp * cy, -sp * sy, -cp], [cp * cy, cp * sy, -sp]])
+
+    def ground_to_pixel(self, points_robot_m: Sequence[Point2D]) -> list[Point2D | None]:
+        """Inverse of project_pixel for calibration checks; None when not visible."""
+        import cv2
+        import numpy as np
+
+        c = self.camera
+        centre = np.array([c.forward_offset_m, c.left_offset_m, c.height_m])
+        rotation = self.rotation_optical_from_robot()
+        result = []
+        for x, y in points_robot_m:
+            optical = rotation @ (np.array([_finite(x, "x"), _finite(y, "y"), 0.0]) - centre)
+            if optical[2] <= 1e-9:
+                result.append(None)
+                continue
+            source = optical.reshape(1, 1, 3)
+            zero = np.zeros(3)
+            coefficients = np.array(c.distortion_coefficients, dtype=float)
+            if c.distortion_model == "fisheye":
+                pixels, _ = cv2.fisheye.projectPoints(source, zero, zero, c.matrix, coefficients)
+            else:
+                pixels, _ = cv2.projectPoints(source, zero, zero, c.matrix,
+                                              coefficients if c.distortion_model == "opencv" else None)
+            u, v = (float(value) for value in pixels.reshape(2))
+            result.append((u, v) if 0 <= u < c.image_width and 0 <= v < c.image_height else None)
+        return result
+
     def project_pixel(self, pixel: Sequence[float]) -> ProjectedPoint:
         try:
             if len(pixel) != 2:
@@ -127,8 +204,8 @@ class GroundProjector:
         c = self.camera
         if not (0 <= u < c.image_width and 0 <= v < c.image_height):
             return ProjectedPoint("outside_image")
-        # K^-1 [u,v,1], then optical(right/down/forward) -> robot FLU.
-        rx, ry = (u - c.cx) / c.fx, (v - c.cy) / c.fy
+        # K^-1 [u,v,1] (undistorted), then optical(right/down/forward) -> robot FLU.
+        rx, ry = self.normalized_ray(u, v)
         dx, dy, dz = self.cp - self.sp * ry, -rx, -self.sp - self.cp * ry
         dx, dy = self.cy * dx - self.sy * dy, self.sy * dx + self.cy * dy
         norm = math.hypot(dx, dy, dz)
