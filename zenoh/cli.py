@@ -219,13 +219,16 @@ class CliRuntime:
         self.output(f"start_ready={state.start_ready} go2_fresh={go2.fresh} go2_state="
                     f"{go2.robot_state.state if go2.robot_state else None} accepting={go2.accepting_commands}")
         if state.goal:
-            self.output(f"goal=({state.goal.x:g}, {state.goal.y:g}) revision={state.goal_revision} "
-                        f"instruction={state.goal.instruction!r}")
+            self.output(f"goal={state.goal.describe()} revision={state.goal_revision} "
+                        f"reached={state.goal_reached} instruction={state.goal.instruction!r}")
         self.output(state.status_message)
         if state.stage == "inference":
             cycle = state.cycle
             self.output(f"cycle={cycle.cycle_id} phase={cycle.phase} completed_steps={cycle.completed} "
                         f"executor_fresh={cycle.executor_fresh} motion={cycle.executor_motion}")
+            if cycle.goal_distance_m is not None:
+                self.output(f"goal_distance={cycle.goal_distance_m:.2f} m image=({cycle.goal_image[0]:.3f}, "
+                            f"{cycle.goal_image[1]:.3f})")
         if inf.last_error:
             self.output(f"error={inf.last_error}")
         return state
@@ -249,11 +252,20 @@ class CliRuntime:
             if current is None:
                 raise ValueError("This node has no goal")
             self.set_goal(GoalConfig(x=float(parts[0]), y=float(parts[1]), instruction=current.instruction))
+        elif name == "goal_m":
+            parts = rest.split()
+            if len(parts) != 2:
+                raise ValueError("Usage: goal_m <forward metres> <left metres>")
+            current = self.state().goal
+            if current is None:
+                raise ValueError("This node has no goal")
+            self.set_goal(GoalConfig(forward_m=float(parts[0]), left_m=float(parts[1]),
+                                     instruction=current.instruction))
         elif name == "ins":
             current = self.state().goal
             if current is None:
                 raise ValueError("This node has no goal")
-            self.set_goal(GoalConfig(x=current.x, y=current.y, instruction=rest.strip()))
+            self.set_goal(current.model_copy(update={"instruction": rest.strip()}))
         elif name == "watch":
             seconds = float(rest.strip() or 10)
             if not math.isfinite(seconds) or not 0 < seconds <= 3600:
@@ -269,7 +281,8 @@ class CliRuntime:
             except KeyboardInterrupt:
                 self.output("Watch stopped; inference remains in its current state.")
         elif name == "help":
-            self.output("start | stop | status | goal <x 0..1> <y 0..1> | ins <text> | watch [seconds] | quit")
+            self.output("start | stop | status | goal <x 0..1> <y 0..1> | goal_m <forward> <left> | ins <text> | "
+                        "watch [seconds] | quit")
             self.output("processes | logs [node|camera|go2|executor|viewer]")
             self.output("Goal/instruction changes stop inference and leave it paused. This CLI sends no Go2 commands.")
         elif name in ("processes", "logs"):

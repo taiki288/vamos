@@ -20,7 +20,7 @@ from PIL import Image
 import zenoh
 
 from cli import CliRuntime
-from config import ControlCommand, NodeConfig, PlanarPose
+from config import ControlCommand, GoalConfig, NodeConfig, PlanarPose
 from fake_go2 import SimulatedGo2, serve
 from go2_executor import ExecutorConfig, ExecutorRuntime, Go2StepExecutor
 from inference import InferenceOutput
@@ -140,6 +140,46 @@ class StopGoNodeTests(unittest.TestCase):
                 self.state.receive_executor(feedback)
                 self.assertFalse(self.state.snapshot().inference.enabled)
                 self.assertFalse(self.state.complete_inference(request, 0.1, Mock()))
+
+    def test_executor_goal_point_is_used_for_the_cycle(self):
+        self.start()
+        self.state.receive_executor(executor_feedback(self.state.snapshot()).model_copy(
+            update={"goal_image": (0.25, 0.75), "goal_distance_m": 2.0}))
+        cycle = self.state.snapshot().cycle
+        self.assertEqual((cycle.phase, cycle.goal_image, cycle.goal_distance_m), ("waiting_image", (0.25, 0.75), 2.0))
+        self.inputs(self.config.inference.stop_go.observation_delay_seconds)
+        report_stopped(self.state)
+        request = self.state.begin_inference()
+        self.assertEqual((request.goal.x, request.goal.y), (0.25, 0.75))
+        self.assertEqual(request.goal.instruction, self.config.inference.goal.instruction)
+
+    def test_reached_goal_ends_the_run_until_start(self):
+        self.start()
+        self.state.receive_executor(executor_feedback(self.state.snapshot()).model_copy(
+            update={"goal_reached": True, "goal_distance_m": 0.3}))
+        state = self.state.snapshot()
+        self.assertTrue(state.goal_reached)
+        self.assertFalse(state.inference.enabled)
+        self.assertIn("Goal reached.", state.status_message)
+        report_stopped(self.state)
+        self.start()
+        self.assertFalse(self.state.snapshot().goal_reached)
+
+    def test_metric_goal_needs_an_executor_image_point(self):
+        self.state.receive_command(ControlCommand(type="goal", goal=GoalConfig(forward_m=3.0, left_m=0.0)))
+        report_stopped(self.state)
+        self.start()
+        report_stopped(self.state)  # A plain report without goal_image.
+        self.assertFalse(self.state.snapshot().inference.enabled)
+        self.assertIn("metric goal", self.state.snapshot().status_message)
+
+    def test_small_pose_noise_during_inference_is_not_motion(self):
+        self.start()
+        request = self.observe()
+        noisy = PlanarPose(x=0.01, y=-0.01, yaw=0.02)
+        self.state.receive_executor(executor_feedback(self.state.snapshot(), pose=noisy))
+        self.assertTrue(self.state.snapshot().inference.enabled)
+        self.assertTrue(self.state.complete_inference(request, 0.1, Mock()))
 
     def test_long_stopped_inference_is_accepted_within_its_budget(self):
         self.start()

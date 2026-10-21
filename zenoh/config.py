@@ -43,13 +43,43 @@ class Go2Config(Settings):
     _key = field_validator("zenoh_key_prefix")(concrete_key)
 
 
+Fraction = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+Metres = Annotated[float, Field(ge=-100, le=100, allow_inf_nan=False)]
+
+
 class GoalConfig(Settings):
-    # Fractions of image width/height; quantized to VAMOS's 0..1023 loc tokens.
-    x: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
-    y: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+    """A ground goal, given once and then held fixed in the world by the executor.
+
+    Either an image point (x, y as fractions of width/height, interpreted on
+    the first standing observation) or a metric offset from the robot when the
+    goal is first anchored (forward_m, left_m). Inference always receives image
+    fractions, quantized to VAMOS's 0..1023 location tokens.
+    """
+
+    x: Fraction | None = None
+    y: Fraction | None = None
+    forward_m: Metres | None = None
+    left_m: Metres | None = None
     instruction: Annotated[StrictStr, Field(max_length=4096)] = ""
 
+    @model_validator(mode="after")
+    def one_form(self):
+        image, metric = (self.x, self.y), (self.forward_m, self.left_m)
+        if not ((None not in image and metric == (None, None)) or (None not in metric and image == (None, None))):
+            raise ValueError("a goal needs either x and y (image fractions) or forward_m and left_m (metres)")
+        return self
+
+    @property
+    def is_image(self) -> bool:
+        return self.x is not None
+
+    def describe(self) -> str:
+        return (f"image ({self.x:g}, {self.y:g})" if self.is_image
+                else f"{self.forward_m:g} m forward, {self.left_m:g} m left")
+
     def tokens(self) -> tuple[int, int]:
+        if not self.is_image:
+            raise ValueError("a metric goal has no image point until the executor projects it")
         return min(1023, int(self.x * 1024)), min(1023, int(self.y * 1024))
 
     def pixels(self, width: int, height: int) -> tuple[float, float]:
@@ -71,6 +101,9 @@ class StopGoConfig(Settings):
     observation_delay_seconds: Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)] = 0.2
     image_wait_timeout_seconds: PositiveSeconds = 5.0
     movement_timeout_seconds: PositiveSeconds = 4.0
+    # Executor pose changes up to these are odometry noise, not motion.
+    observation_pose_tolerance_m: PositiveSeconds = 0.05
+    observation_pose_tolerance_rad: PositiveSeconds = 0.05
 
     @model_validator(mode="after")
     def timeouts(self):
@@ -146,6 +179,10 @@ class Go2RobotState(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
     state: StrictStr
     motion: Literal["moving", "quiescent", "unknown"]
+    # Proposed odometry fields (SportModeState.position and IMU yaw); optional
+    # until unitree-go2-zenoh-node publishes them.
+    position: tuple[float, float, float] | None = None
+    yaw: float | None = None
 
 
 class Go2NodeState(BaseModel):
@@ -217,6 +254,8 @@ class CycleState(Settings):
     inference_id: int | None = None
     executor_fresh: bool = False
     executor_motion: Literal["stopped", "moving", "settling", "error"] | None = None
+    goal_image: tuple[float, float] | None = None  # The goal fractions used for this cycle.
+    goal_distance_m: float | None = None
 
 
 class NodeState(Settings):
@@ -237,6 +276,7 @@ class NodeState(Settings):
     camera: CameraState
     go2: Go2State
     inference: InferenceState = Field(default_factory=InferenceState)
+    goal_reached: bool = False
 
 
 FinitePixel = Annotated[float, Field(allow_inf_nan=False)]
@@ -260,6 +300,12 @@ class ExecutorState(Settings):
     inference_id: int | None = None
     pose: PlanarPose
     path_m: list[tuple[FiniteFloat, FiniteFloat]] = []  # Current step's ground path, same frame as pose.
+    # With "stopped" while the node waits for it: where the world-fixed goal
+    # appears now, or that it has been reached.
+    goal_image: tuple[Fraction, Fraction] | None = None
+    goal_distance_m: Annotated[float, Field(ge=0, allow_inf_nan=False)] | None = None
+    goal_reached: bool = False
+    goal_world_m: tuple[FiniteFloat, FiniteFloat] | None = None  # Anchored goal, same frame as pose.
     message: str = ""
 
 

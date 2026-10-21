@@ -95,6 +95,9 @@ class TransportState:
         self._executor = None
         self._executor_at = None
         self._observation_pose = None
+        self._cycle_goal: GoalConfig | None = None
+        self._cycle_goal_distance: float | None = None
+        self._goal_reached = False
 
     @property
     def stop_go(self):
@@ -103,6 +106,8 @@ class TransportState:
 
     def _set_cycle_phase(self, phase):
         self._cycle_phase, self._cycle_at = phase, self.clock()
+        if phase in ("waiting_stop", "paused"):
+            self._cycle_goal = self._cycle_goal_distance = None
 
     def _pause(self, reason):
         self._inference_enabled = False
@@ -116,6 +121,12 @@ class TransportState:
                     and now - self._executor_at <= self.config.inference.stop_go.executor_timeout_seconds
                     and state.node_session_id == self._session_id and state.control_epoch == self._epoch
                     and state.cycle_id == self._cycle_id)
+
+    def _pose_moved(self, pose) -> bool:
+        settings, reference = self.config.inference.stop_go, self._observation_pose
+        turn = math.atan2(math.sin(pose.yaw - reference.yaw), math.cos(pose.yaw - reference.yaw))
+        return (math.hypot(pose.x - reference.x, pose.y - reference.y) > settings.observation_pose_tolerance_m
+                or abs(turn) > settings.observation_pose_tolerance_rad)
 
     def receive_executor(self, state: ExecutorState):
         with self._lock:
@@ -132,9 +143,23 @@ class TransportState:
             if state.motion == "error":
                 self._pause(f"Executor stopped the cycle: {state.message}")
             elif self._cycle_phase in ("waiting_image", "inferencing") and (
-                    state.motion != "stopped" or state.pose != self._observation_pose):
+                    state.motion != "stopped" or self._pose_moved(state.pose)):
                 self._pause("Executor moved during observation/inference; start required.")
             elif self._cycle_phase == "waiting_stop" and state.motion == "stopped":
+                if state.goal_reached:
+                    self._goal_reached = True
+                    self._pause("Goal reached.")
+                    return
+                if state.goal_image is not None:
+                    # The executor holds the goal fixed in the world and projects it per cycle.
+                    self._cycle_goal = GoalConfig(x=state.goal_image[0], y=state.goal_image[1],
+                                                  instruction=self._goal.instruction)
+                elif self._goal.is_image:
+                    self._cycle_goal = self._goal
+                else:
+                    self._pause("Executor gave no image point for the metric goal; start required.")
+                    return
+                self._cycle_goal_distance = state.goal_distance_m
                 self._min_cycle_frame = 0 if self._frame is None else self._frame.sequence
                 self._stop_confirmed_at = self.clock()
                 self._observation_pose = state.pose
@@ -215,6 +240,7 @@ class TransportState:
             self._goal = command.goal
             self._goal_revision += 1
             self._epoch += 1
+            self._goal_reached = False
             return
         blocker = self._start_blocker(self.snapshot())
         if blocker:
@@ -225,6 +251,7 @@ class TransportState:
         self._inputs_seen = True
         self._inference_error = None
         self._pause_reason = None
+        self._goal_reached = False
         if self.stop_go:
             self._cycle_id += 1
             self._cycle_inference_id = None
@@ -305,7 +332,7 @@ class TransportState:
             self._set_cycle_phase("inferencing")
             return InferenceRequest(self._request_id, self._epoch,
                                     ReceivedFrame(frame.sequence, frame.received_at, frame.image.copy()),
-                                    self._goal, self._goal_revision, self._cycle_id)
+                                    self._cycle_goal, self._goal_revision, self._cycle_id)
 
     def complete_inference(self, request: InferenceRequest, duration: float, publish: Callable[[], None]) -> bool:
         # Serialize the final acceptance/publication with stop commands. A stopped
@@ -364,7 +391,10 @@ class TransportState:
                 cycle=CycleState(phase=self._cycle_phase,
                     cycle_id=self._cycle_id, completed=self._cycle_completed, inference_id=self._cycle_inference_id,
                     executor_fresh=self._executor_fresh(now),
-                    executor_motion=self._executor.motion if self._executor_fresh(now) else None),
+                    executor_motion=self._executor.motion if self._executor_fresh(now) else None,
+                    goal_image=None if self._cycle_goal is None else (self._cycle_goal.x, self._cycle_goal.y),
+                    goal_distance_m=self._cycle_goal_distance),
+                goal_reached=self._goal_reached,
                 node_session_id=self._session_id, control_epoch=self._epoch,
                 goal=self._goal, goal_revision=self._goal_revision, last_control_ack=self._last_ack,
                 lifecycle=lifecycle,

@@ -12,9 +12,17 @@ Go2 node state, and it is the only VAMOS process that publishes
   cycle (zero except during one bounded step); one zero when a stop begins
 
 "Stopped" feedback requires Go2 to report a standing, quiescent state for the
-settling interval while zero velocity is commanded. Go2 publishes no pose, so
-the step bounds and path anchoring use dead reckoning of the executor's own
-commands. Short steps keep that drift bounded; it is not odometry.
+settling interval while zero velocity is commanded.
+
+The goal is anchored once per goal revision as a point on the ground in the
+odometry frame. Before each observation the executor projects it into the
+camera image and reports that point with "stopped"; a goal out of view first
+triggers a turn in place, and a goal within `goal.arrival_tolerance_m` (or in
+the camera's near blind zone) is reported as reached, which ends the run.
+
+Pose comes from Go2 (`pose_source: "go2"`, the proposed `robot_state.position`
+and `yaw` fields) or from dead reckoning of the executor's own commands
+(`"dead_reckoning"`), which drifts over long runs.
 """
 
 from __future__ import annotations
@@ -48,8 +56,14 @@ LOGGER = logging.getLogger(__name__)
 HERE = Path(__file__).resolve().parent
 GO2_RESTING_STATES = frozenset(("damping", "down"))
 GO2_STANDING_STATES = frozenset(("ready_stand", "locomotion"))
-Phase = Literal["idle", "standing", "holding", "moving", "settling", "stopping", "error"]
-ACTIVE_PHASES = frozenset(("standing", "holding", "moving", "settling", "error"))
+Phase = Literal["idle", "standing", "holding", "turning", "moving", "settling", "stopping", "error"]
+ACTIVE_PHASES = frozenset(("standing", "holding", "turning", "moving", "settling", "error"))
+MIN_TURN_RATE_RPS = 0.15
+MAX_TURNS_WITHOUT_VIEW = 2
+
+
+def wrap(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
 
 
 class Go2Timing(Settings):
@@ -71,8 +85,14 @@ class ExecutorMotion(Settings):
         return PurePursuitConfig(**self.model_dump())
 
 
+class GoalSettings(Settings):
+    arrival_tolerance_m: PositiveSeconds = 0.5
+    turn_tolerance_rad: PositiveSeconds = 0.05
+
+
 class ExecutorConfig(Settings):
     camera_calibration: Annotated[StrictStr, Field(min_length=1)]
+    pose_source: Literal["dead_reckoning", "go2"] = "dead_reckoning"
     allow_assumed_calibration: StrictBool = False
     selection: Literal["medoid", "index"] = "medoid"
     candidate_index: Annotated[int, Field(strict=True, ge=0)] = 0
@@ -83,6 +103,7 @@ class ExecutorConfig(Settings):
     shutdown_timeout_seconds: PositiveSeconds = 15.0
     go2: Go2Timing = Field(default_factory=Go2Timing)
     motion: ExecutorMotion = Field(default_factory=ExecutorMotion)
+    goal: GoalSettings = Field(default_factory=GoalSettings)
 
     @model_validator(mode="after")
     def valid_controller(self):
@@ -123,6 +144,13 @@ class _Step:
     yaw_rad: float = 0.0
 
 
+@dataclass(frozen=True)
+class _GoalReport:
+    reached: bool
+    image: tuple[float, float] | None
+    distance_m: float
+
+
 class Go2StepExecutor:
     """Thread-safe stop-go executor logic; Zenoh I/O lives in ExecutorRuntime."""
 
@@ -142,7 +170,13 @@ class Go2StepExecutor:
         self.go2: Go2NodeState | None = None
         self.go2_at: float | None = None
         self.pose = Pose2D(0.0, 0.0, 0.0)
+        self._pose_valid = config.pose_source == "dead_reckoning"
+        self._pose_delta = (0.0, 0.0)
         self.command = VelocityCommand()
+        self._goal_anchor: tuple[tuple[str, int], tuple[float, float]] | None = None
+        self._goal_report: _GoalReport | None = None
+        self._turn: tuple[float, float] | None = None  # (target yaw, deadline)
+        self._turns_without_view = 0
         self._cycle_key = None
         self._stopped_epoch = None
         self._pending: tuple[TrajectoryResult, float] | None = None
@@ -229,7 +263,7 @@ class Go2StepExecutor:
         self._clear_step()
 
     def _clear_step(self):
-        self._pending = self._step = None
+        self._pending = self._step = self._turn = None
         self.command = VelocityCommand()
 
     def _begin_stop(self, now, reason):
@@ -269,14 +303,105 @@ class Go2StepExecutor:
             return
         epoch_changed = self._cycle_key is None or key[:2] != self._cycle_key[:2]
         self._cycle_key = key
-        self._pending, self._executed = None, None
-        if self._step is not None:  # A new cycle never continues an old step.
-            self._step = None
+        self._pending, self._executed, self._goal_report = None, None, None
+        if self._step is not None or self._turn is not None:  # A new cycle never continues old motion.
+            self._step = self._turn = None
             self.command = VelocityCommand()
+            if self.phase in ("moving", "turning"):
+                self.phase, self._quiescent_since = "holding", None
         if epoch_changed and self.phase == "error":
             self.phase, self.error = "idle", None
         elif self.phase == "settling":
             self.phase = "holding"
+
+    # Pose and goal --------------------------------------------------------------
+    def _update_pose(self, now, dt):
+        before = self.pose
+        if self.config.pose_source == "go2":
+            state = self.go2.robot_state if self._go2_fresh(now) else None
+            self._pose_valid = state is not None and state.position is not None and state.yaw is not None
+            if self._pose_valid:
+                self.pose = Pose2D(float(state.position[0]), float(state.position[1]), wrap(float(state.yaw)))
+        else:
+            # Integrate the command published during the last period.
+            yaw = before.yaw + self.command.vyaw * dt
+            self.pose = Pose2D(before.x + self.command.vx * math.cos(before.yaw) * dt,
+                               before.y + self.command.vx * math.sin(before.yaw) * dt, wrap(yaw))
+        self._pose_delta = (math.hypot(self.pose.x - before.x, self.pose.y - before.y),
+                            abs(wrap(self.pose.yaw - before.yaw)))
+
+    def _goal_relative(self) -> tuple[float, float]:
+        (gx, gy), pose = self._goal_anchor[1], self.pose
+        dx, dy = gx - pose.x, gy - pose.y
+        cosine, sine = math.cos(pose.yaw), math.sin(pose.yaw)
+        return dx * cosine + dy * sine, -dx * sine + dy * cosine
+
+    def _anchor_goal(self, node) -> bool:
+        goal, camera = node.goal, self.projector.camera
+        if goal is None:
+            self._fail("the node has no goal")
+            return False
+        if goal.is_image:
+            pixel = (min(goal.x * camera.image_width, camera.image_width - 1e-6),
+                     min(goal.y * camera.image_height, camera.image_height - 1e-6))
+            projected = self.projector.project_pixel(pixel)
+            if projected.status != "ok":
+                self._fail(f"image goal {goal.describe()} is not on visible ground in range ({projected.status})")
+                return False
+            relative = projected.point_robot_m
+        else:
+            relative = (goal.forward_m, goal.left_m)
+        world = path_to_world([relative], self.pose)[0]
+        self._goal_anchor = ((node.node_session_id, node.goal_revision), world)
+        self._turns_without_view = 0
+        self._event("goal_anchored", goal=goal.describe(), world=world, pose=asdict(self.pose))
+        LOGGER.info("Goal %s anchored at world (%.2f, %.2f)", goal.describe(), *world)
+        return True
+
+    def _resolve_goal(self, now):
+        """At a settled stop: report the goal's image point, its arrival, or turn toward it."""
+        node, camera = self.node, self.projector.camera
+        if self._goal_anchor is None or self._goal_anchor[0] != (node.node_session_id, node.goal_revision):
+            if not self._anchor_goal(node):
+                return
+        forward, left = self._goal_relative()
+        distance = math.hypot(forward, left)
+        if distance <= self.config.goal.arrival_tolerance_m:
+            self._goal_report = _GoalReport(True, None, distance)
+            return
+        pixel = self.projector.ground_to_pixel([(forward, left)])[0]
+        if pixel is not None:
+            self._turns_without_view = 0
+            self._goal_report = _GoalReport(False, (pixel[0] / camera.image_width, pixel[1] / camera.image_height),
+                                            distance)
+            return
+        bearing = math.atan2(left, forward)
+        reach = min(camera.max_distance_m, 5.0)
+        if self.projector.ground_to_pixel([(reach * math.cos(bearing), reach * math.sin(bearing))])[0] is not None:
+            # In the horizontal field of view but nearer than the visible ground.
+            self._event("goal_in_blind_zone", distance_m=distance)
+            self._goal_report = _GoalReport(True, None, distance)
+            return
+        if self._turns_without_view >= MAX_TURNS_WITHOUT_VIEW:
+            return self._fail("the goal stayed out of view after turning toward it")
+        self._turns_without_view += 1
+        deadline = now + abs(bearing) / self.config.motion.max_yaw_rate_rps + 3.0
+        self._turn = (wrap(self.pose.yaw + bearing), deadline)
+        self.phase = "turning"
+        self._event("turn_toward_goal", bearing_rad=bearing, distance_m=distance)
+
+    def _advance_turn(self, now):
+        target, deadline = self._turn
+        error = wrap(target - self.pose.yaw)
+        if abs(error) <= self.config.goal.turn_tolerance_rad:
+            self._turn, self.command = None, VelocityCommand()
+            self.phase, self._quiescent_since = "holding", None
+            return
+        if now >= deadline:
+            return self._fail("turning toward the goal timed out")
+        limit = self.config.motion.max_yaw_rate_rps
+        rate = max(-limit, min(limit, 2.0 * error))
+        self.command = VelocityCommand(vyaw=math.copysign(max(abs(rate), min(limit, MIN_TURN_RATE_RPS)), error))
 
     def _start_step(self, now):
         node, (result, received_at) = self.node, self._pending
@@ -312,15 +437,10 @@ class Go2StepExecutor:
         self._quiescent_since = None
         self.phase = "settling"
 
-    def _advance_step(self, now, dt):
+    def _advance_step(self, now):
         step, bounds = self._step, self.stop_go
-        before = self.pose
-        yaw = before.yaw + self.command.vyaw * dt
-        cosine, sine = math.cos(before.yaw), math.sin(before.yaw)
-        self.pose = Pose2D(before.x + self.command.vx * cosine * dt, before.y + self.command.vx * sine * dt,
-                           math.atan2(math.sin(yaw), math.cos(yaw)))
-        step.distance_m += math.hypot(self.pose.x - before.x, self.pose.y - before.y)
-        step.yaw_rad += abs(self.command.vyaw) * dt
+        step.distance_m += self._pose_delta[0]
+        step.yaw_rad += self._pose_delta[1]
         if now - step.received_at > self.config.result_validity_seconds:
             return self._finish_step("result_validity")
         if now - step.started_at >= bounds.max_step_seconds:
@@ -353,6 +473,7 @@ class Go2StepExecutor:
             now = self.clock() if now is None else now
             dt = 0.0 if self._last_tick is None else min(0.1, max(0.0, now - self._last_tick))
             self._last_tick = now
+            self._update_pose(now, dt)
             if self.shutdown_requested and not self.shutdown_complete and self.phase != "stopping":
                 if self.phase in ACTIVE_PHASES or (self._go2_available(now) and not self._resting()):
                     self._begin_stop(now, "shutdown")
@@ -369,16 +490,18 @@ class Go2StepExecutor:
                     if not self._resting():
                         self._begin_stop(now, "robot not resting at startup")
             else:
-                self._run_cycle(now, dt)
+                self._run_cycle(now)
             return self._outputs(now)
 
-    def _run_cycle(self, now, dt):
+    def _run_cycle(self, now):
         self._sync_cycle()
         if self.phase == "error":
             self.command = VelocityCommand()
             return
         if not self._go2_available(now):
             return self._fail("Go2 state is stale, disconnected or not accepting commands")
+        if not self._pose_valid:
+            return self._fail("Go2 state has no position/yaw; use pose_source dead_reckoning")
         self._startup_rest_checked = True
         if self.phase == "idle":
             if self._standing():
@@ -398,20 +521,28 @@ class Go2StepExecutor:
                 return
         if not self._standing():
             return self._fail(f"Go2 left the standing state: {self.go2.robot_state.state}")
-        if self.phase == "moving":
-            self._advance_step(now, dt)
-        elif (self.phase == "holding" and self.node.cycle.phase == "moving" and self._pending is not None
-                and self._settled(now)):
-            self._start_step(now)
-            if self.phase == "moving":
-                self._advance_step(now, 0.0)
+        if self.phase == "turning":
+            self._advance_turn(now)
+        elif self.phase == "moving":
+            self._advance_step(now)
+        elif self.phase == "holding" and self._settled(now):
+            if self.node.cycle.phase == "waiting_stop" and self._goal_report is None:
+                self._resolve_goal(now)
+                if self.phase == "turning":
+                    self._advance_turn(now)
+            elif self.node.cycle.phase == "moving" and self._pending is not None:
+                self._start_step(now)
+                if self.phase == "moving":
+                    self._pose_delta = (0.0, 0.0)
+                    self._advance_step(now)
         self._track_quiescence(now)
 
     def _outputs(self, now) -> ExecutorOutput:
         velocity = None
         if self._zero_pending:
             velocity, self._zero_pending = VelocityCommand(), False
-        elif self.phase in ("holding", "moving", "settling") or (self.phase == "error" and self._standing_now(now)):
+        elif (self.phase in ("holding", "turning", "moving", "settling")
+                or (self.phase == "error" and self._standing_now(now))):
             velocity = self.command
         posture, self._posture_pending = self._posture_pending, None
         return ExecutorOutput(velocity, posture, self._feedback(now))
@@ -427,27 +558,38 @@ class Go2StepExecutor:
             motion, message = "error", self.error
         elif self.phase == "moving":
             motion, message = "moving", "executing step"
+        elif self.phase == "turning":
+            motion, message = "moving", "turning toward the goal"
         elif self.phase in ("holding", "settling"):
             motion = "stopped" if self._settled(now) else "settling"
             message = "standing still" if motion == "stopped" else "settling"
+            if (motion == "stopped" and self.phase == "holding" and node.cycle.phase == "waiting_stop"
+                    and self._goal_report is None):
+                motion, message = "settling", "locating the goal"
         elif self.phase == "idle" and self._go2_available(now) and self.go2.robot_state.motion == "quiescent":
             motion, message = "stopped", "idle; start stands the robot first"
         elif self.phase == "idle" and not self._go2_available(now):
             motion, message = "error", "Go2 state is stale, disconnected or not accepting commands"
         else:
             motion, message = "settling", self.phase
+        report = self._goal_report if motion == "stopped" and self.phase == "holding" else None
         return ExecutorState(executor_session_id=self.session_id,
                              node_session_id=node.node_session_id, control_epoch=node.control_epoch,
                              cycle_id=node.cycle.cycle_id, motion=motion,
                              inference_id=self._executed if self.phase == "settling" else None,
                              pose=PlanarPose(**asdict(self.pose)),
                              path_m=list(self._step.path) if self._step is not None else [],
+                             goal_image=None if report is None else report.image,
+                             goal_distance_m=None if report is None else report.distance_m,
+                             goal_reached=report is not None and report.reached,
+                             goal_world_m=None if self._goal_anchor is None else self._goal_anchor[1],
                              message=message or "")
 
     def snapshot(self) -> dict:
         with self.lock:
             return {"phase": self.phase, "error": self.error, "last_error": self.last_error,
                     "command": self.command.as_message(), "pose": asdict(self.pose),
+                    "goal_world": None if self._goal_anchor is None else self._goal_anchor[1],
                     "go2_state": None if self.go2 is None else self.go2.robot_state.state,
                     "events": list(self.events)}
 

@@ -1,7 +1,8 @@
 # VAMOS Zenoh nodes
 
 Run VAMOS image-path inference over Zenoh and execute it on a Unitree Go2 as
-short **stop / observe / infer / move** steps. The key/QoS layout and the Go2
+short **stop / observe / infer / move** steps toward a goal that is given once,
+held fixed on the ground, and ends the run when reached. The key/QoS layout and the Go2
 safety contract follow the
 [NaVILA Zenoh node](https://github.com/Oya-Tomo/NaVILA/tree/feat/2-navila-zenoh-node/zenoh);
 the camera and robot bridges are separate projects:
@@ -33,7 +34,7 @@ Development and setup tools live in `tools/`:
 | Tool | Role |
 | --- | --- |
 | `tools/fake_camera.py` | Publishes one test image as the camera stream |
-| `tools/fake_go2.py` | Simulated Go2 node (same Zenoh contract) with an optional 2D view |
+| `tools/fake_go2.py` | Simulated Go2 node (same Zenoh contract, plus the proposed position/yaw; `--no-pose` omits them) with an optional 2D view |
 | `tools/viewer.py` | Shows `vamos/preview` |
 | `tools/calibrate_camera.py` | Camera intrinsics, mount and verification for ground projection |
 | `tools/projection_demo.py` | One saved or live inference projected to the ground, with the executor's selection |
@@ -66,7 +67,9 @@ This starts the inference node, a test camera, a simulated Go2 (window with
 `--simulator`), the **real** `go2_executor.py` with
 `tools/demo-executor-config.json5`, and the preview viewer. Enter `status`, then
 `start` once `model_loaded=True` and `start_ready=True`: the executor stands the
-simulated Go2, runs one bounded step per inference and lays it down on `stop`.
+simulated Go2, anchors the example goal on the ground, runs one bounded step per
+inference until the goal is reached, and lays the robot down. Try `goal_m 2 1`
+or `goal_m -1 0.5` (behind: the robot turns first) and `start` again.
 `quit`, EOF or Ctrl+C stops inference and closes only the processes this CLI
 started (the executor first, so it can rest the robot); their logs are under
 `outputs/cli` (`logs`, `processes`).
@@ -112,7 +115,9 @@ The executor reads the node config for keys and step bounds, and its own
 `go2-executor-config.json5` for calibration, candidate selection, speeds and
 timeouts. It refuses a calibration that is not `calibrated` unless
 `allow_assumed_calibration: true` (robot-free tests only), and refuses a node
-config without an `inference` section. For several computers, edit the
+config without an `inference` section. Use `pose_source: "go2"` once the Go2
+node publishes `robot_state.position`/`yaw`; until then `"dead_reckoning"`
+drifts with distance, so keep goals short. For several computers, edit the
 listen/connect endpoints so every process reaches the node's listener.
 
 ## Operator CLI
@@ -122,7 +127,8 @@ listen/connect endpoints so every process reaches the node's listener.
 | `status` | Model/device, lifecycle, `start_ready`, status message, input freshness, cycle phase, goal |
 | `start` | Start stop-go cycles when ready |
 | `stop` | Pause, wait for pending inference to be discarded and for stopped feedback |
-| `goal 0.5 0.6` | Set the goal as image width/height fractions in [0, 1] (stops first) |
+| `goal 0.5 0.6` | Set the goal as an image point (width/height fractions in [0, 1]) on the first standing view (stops first) |
+| `goal_m 3 -0.5` | Set the goal as metres forward/left of the robot when it is anchored (stops first) |
 | `ins Follow the open path` | Set the instruction (stops first); bare `ins` clears it |
 | `watch 30` | Print status every second for 30 s |
 | `processes`, `logs [name]` | Inspect processes started by this CLI |
@@ -139,15 +145,17 @@ reported as unconfirmed, never as a successful stop.
 One `start` runs repeated cycles until stopped:
 
 1. The node opens a cycle (`waiting_stop`). The executor stands a resting Go2
-   if needed, holds zero velocity, and reports `stopped` once Go2 observes a
-   standing, quiescent state for `stop_settle_seconds`
-   (`stop_confirm_timeout_seconds`, default 15 s, includes the stand-up).
+   if needed and holds zero velocity until Go2 observes a standing, quiescent
+   state for `stop_settle_seconds`. It then locates the goal (see Goals): it
+   reports `stopped` with the goal's current image point, turns toward a goal
+   out of view first, or reports the goal reached
+   (`stop_confirm_timeout_seconds`, default 15 s, covers stand-up and turning).
 2. `waiting_image`: the node uses the first camera frame **received** at least
    `observation_delay_seconds` (default 0.2 s) after that confirmation, so
-   camera latency cannot pass off a pre-stop image. Raw camera frames work;
-   annotated demo frames must also be captured after the stop.
-3. `inferencing`: exactly one inference while the executor keeps reporting the
-   same stopped pose. Movement during observation or inference pauses the run.
+   camera latency cannot pass off a pre-stop image.
+3. `inferencing`: exactly one inference, using that cycle's goal image point,
+   while the executor keeps reporting the same stopped pose (within
+   `observation_pose_tolerance_m`/`_rad`). Movement pauses the run.
 4. `moving`: the executor selects a candidate, projects it to the ground from
    the stopped pose and follows it until the first of: path end,
    `max_step_seconds`, `max_step_distance_m`, `max_step_yaw_rad`, or
@@ -157,8 +165,8 @@ One `start` runs repeated cycles until stopped:
 
 Any of these pauses the node (an explicit `start` is then required): operator
 `stop`, image or heartbeat expiry, executor feedback expiry or replacement,
-executor `error`, phase timeouts, inference failure or expired result, and
-goal/instruction changes.
+executor `error`, phase timeouts, inference failure or expired result,
+goal/instruction changes, and reaching the goal (`goal_reached` in state).
 
 `start_ready` and `status_message` in `vamos/state` report whether `start`
 would currently be accepted and why not.
@@ -180,12 +188,38 @@ would currently be accepted and why not.
   without a rest confirmation and is logged as such.
 - **Shutdown** (Ctrl+C/SIGTERM) runs the stop path and exits non-zero if rest
   is not confirmed within `shutdown_timeout_seconds`.
-- **Pose** is dead reckoning of the executor's own commands (Go2 publishes no
-  pose). It anchors each step at the stopped pose and enforces step bounds;
-  bounded steps keep drift small, but it is not odometry.
+- **Pose** comes from `pose_source`: Go2 odometry (proposed
+  `robot_state.position`/`yaw`; missing fields are an error) or dead reckoning
+  of the executor's own commands. It anchors goals and steps and enforces step
+  bounds; dead reckoning drifts with distance.
 - **Quiescence** uses the Go2 node's thresholds. If a standing Go2 sways above
   them, the node pauses with "Executor moved during observation"; tune the Go2
   node's `robot_state` thresholds rather than this check.
+
+## Goals
+
+VAMOS needs a goal point in the image; the original ROS stack takes a goal in
+the odometry frame and reprojects it every cycle. The executor does the same:
+
+- **Anchoring**: once per goal revision, at the first settled stop, the goal
+  becomes a ground point in the odometry frame. An image goal (`goal x y`) is
+  projected through the camera calibration and must hit visible ground within
+  `max_distance_m`; a metric goal (`goal_m forward left`) is offset from the
+  current pose. `stop`/`start` keep the anchor; a goal change replaces it.
+  Image goals use the standing camera view, which differs from what a resting
+  robot sees, so prefer `goal_m` when picking goals from a resting preview.
+- **Each cycle**: the goal is transformed to the robot frame and projected into
+  the image with the same calibration, and that point goes to VAMOS with the
+  instruction.
+- **Out of view**: the robot turns in place toward the goal's bearing, settles
+  and rechecks (at most twice without seeing it).
+- **Reached**: within `goal.arrival_tolerance_m`, or when the goal lies in the
+  horizontal field of view but nearer than the visible ground (the camera's
+  near blind zone, which depends on the mount). The node pauses with
+  `Goal reached.` and the executor lays the robot down.
+
+Instructions (`ins`) still steer how VAMOS reaches the goal; they do not choose
+the goal.
 
 ## Camera calibration
 
@@ -236,15 +270,17 @@ Node (`*inference-node-config.example.json5`):
 | `camera.frame_freshness_seconds`, `cli_heartbeat_timeout_seconds` | Input freshness; expiry pauses the run |
 | `go2.node_state_timeout_seconds` | Go2 freshness shown in node state |
 | `inference.num_samples`, `max_new_tokens`, `temperature`, `disable_compile` | VAMOS generation |
-| `inference.goal` | Default goal (image fractions, quantized to VAMOS location tokens) and instruction |
+| `inference.goal` | Default goal: `x`/`y` image fractions or `forward_m`/`left_m`, plus instruction |
 | `inference.stop_go.max_step_seconds` / `max_step_distance_m` / `max_step_yaw_rad` | Step bounds |
 | `inference.stop_go.stop_settle_seconds` | Required quiescent standing time before `stopped` |
 | `inference.stop_go.stop_confirm_timeout_seconds` | Wait for `stopped`, including stand-up |
 | `inference.stop_go.observation_delay_seconds` | Camera latency margin after `stopped` |
+| `inference.stop_go.observation_pose_tolerance_m` / `_rad` | Pose noise allowed while observing/inferring |
 | `inference.stop_go.image_wait_timeout_seconds`, `inference_timeout_seconds`, `movement_timeout_seconds`, `executor_timeout_seconds` | Phase and feedback timeouts |
 
 Executor (`go2-executor-config.example.json5`): `camera_calibration`,
-`allow_assumed_calibration`, `selection`/`candidate_index`/`min_path_length_m`,
+`allow_assumed_calibration`, `pose_source`, `goal.arrival_tolerance_m`,
+`goal.turn_tolerance_rad`, `selection`/`candidate_index`/`min_path_length_m`,
 `control_frequency_hz`, `node_state_timeout_seconds`, `result_validity_seconds`,
 `shutdown_timeout_seconds`, `go2.{state,stand,down}_timeout_seconds`, and
 `motion` (Pure Pursuit speeds, lookahead, tolerances).
@@ -280,7 +316,9 @@ at that hub directory under `/mnt/c`; `HF_HUB_OFFLINE=1` and
 `TRANSFORMERS_OFFLINE=1` then verify cache-only inference.
 
 On Windows with an RTX 5060, `cli.py --demo` ran the real model, executor and
-simulated Go2 for 15 stop-go cycles (about 0.7 s per inference). Earlier, before the Go2 executor: Ubuntu 24.04 under WSL2 x86_64 with
+simulated Go2: the example image goal was anchored about 2.8 m ahead and
+reached in 10 stop-go cycles (about 0.65 s per inference), then the robot lay
+down. Earlier, before the Go2 executor: Ubuntu 24.04 under WSL2 x86_64 with
 an RTX 5060 (Python 3.11.17, Torch 2.13.0+cu130) ran real 10-path inference,
 projection and 2D following, including WSLg windows. Jetson/aarch64 and
 physical Go2 operation have not been validated.

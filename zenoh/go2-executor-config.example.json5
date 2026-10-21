@@ -4,6 +4,10 @@
   camera_calibration: "ground-camera.json",
   allow_assumed_calibration: false, // Set true only for robot-free tests.
 
+  // "go2": robot_state.position/yaw from the Go2 node (proposed fields).
+  // "dead_reckoning": integrate this executor's own commands; drifts over long runs.
+  pose_source: "dead_reckoning",
+
   selection: "medoid", // "medoid" or "index" (uses candidate_index).
   candidate_index: 0,
   min_path_length_m: 0.05,
@@ -12,6 +16,11 @@
   node_state_timeout_seconds: 1.0,
   result_validity_seconds: 3.0, // From result receipt to the end of its step.
   shutdown_timeout_seconds: 15.0,
+
+  goal: {
+    arrival_tolerance_m: 0.5, // Also reached once the goal is in the camera's near blind zone.
+    turn_tolerance_rad: 0.05,
+  },
 
   go2: {
     state_timeout_seconds: 0.5,

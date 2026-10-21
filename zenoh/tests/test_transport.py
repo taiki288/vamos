@@ -68,6 +68,17 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(config.keys()["go2_state"], "unitree/go2/state")
         self.assertEqual(config.keys()["state"], "vamos/state")
 
+    def test_goal_is_either_an_image_point_or_a_metric_offset(self):
+        from config import GoalConfig
+
+        self.assertTrue(GoalConfig(x=0.5, y=0.6).is_image)
+        self.assertEqual(GoalConfig(forward_m=2, left_m=-1).describe(), "2 m forward, -1 m left")
+        for data in ({}, {"x": 0.5}, {"x": 0.5, "y": 0.5, "forward_m": 1, "left_m": 0}, {"forward_m": 1}):
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                GoalConfig.model_validate(data)
+        with self.assertRaises(ValueError):
+            GoalConfig(forward_m=1, left_m=0).tokens()
+
     def test_invalid_config_cannot_create_wildcard_or_colliding_channels(self):
         for change in ("wildcard", "collision", "nan", "infinite_period", "unknown"):
             with self.subTest(change=change):

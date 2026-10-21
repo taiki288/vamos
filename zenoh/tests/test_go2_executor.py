@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 import json
+import math
 from pathlib import Path
 from queue import Empty, Queue
 import socket
@@ -18,7 +19,7 @@ from PIL import Image
 from pydantic import ValidationError
 import zenoh
 
-from config import ControlCommand, Go2NodeState, NodeConfig, TrajectoryResult
+from config import ControlCommand, GoalConfig, Go2NodeState, NodeConfig, TrajectoryResult
 from fake_go2 import SimulatedGo2
 from controller import VelocityCommand
 from go2_executor import ExecutorConfig, ExecutorRuntime, Go2StepExecutor, load_camera
@@ -51,7 +52,9 @@ class FakeGo2(SimulatedGo2):
         return Go2NodeState.model_validate(self.step(now))
 
 
-class Go2ExecutorTests(unittest.TestCase):
+class ExecutorHarness:
+    """Real node state machine + executor + simulated Go2, on a manual clock."""
+
     def setUp(self, stop_go=None):
         self.now, self.wall = 100.0, 1000.0
         self.node_config = NodeConfig.model_validate({**CONFIG, "inference": {**CONFIG["inference"], "stop_go": {
@@ -65,6 +68,7 @@ class Go2ExecutorTests(unittest.TestCase):
         self.heartbeat = True
         self.paths = [STRAIGHT]
         self.feedback = []
+        self.requests = []
         for _ in range(4):
             self.pump()
 
@@ -89,6 +93,7 @@ class Go2ExecutorTests(unittest.TestCase):
         if infer:
             request = self.node.begin_inference()
             if request is not None:
+                self.requests.append((request, len(self.robot.velocities)))
                 self.node.complete_inference(request, 0.1, lambda: self.executor.receive_result(self.result(request)))
         return output
 
@@ -111,6 +116,8 @@ class Go2ExecutorTests(unittest.TestCase):
                 return
         self.fail(f"condition not reached: {self.executor.snapshot()} {self.node.snapshot()}")
 
+
+class Go2ExecutorTests(ExecutorHarness, unittest.TestCase):
     def test_cycle_stands_moves_within_bounds_and_completes(self):
         self.assertEqual(self.robot.postures, [])  # Resting at startup needs no command.
         self.assertTrue(self.node.snapshot().start_ready)
@@ -210,6 +217,69 @@ class Go2ExecutorTests(unittest.TestCase):
         self.assertFalse(self.node.snapshot().start_ready)
         with self.assertRaisesRegex(ValueError, "executor"):
             self.start()
+
+
+class GoalTests(ExecutorHarness, unittest.TestCase):
+    """World-fixed goals: anchoring, per-cycle projection, turning and arrival."""
+
+    def set_goal(self, **goal):
+        self.node.receive_command(ControlCommand(type="goal", goal=GoalConfig(**goal)))
+        for _ in range(3):
+            self.pump()
+
+    def test_metric_goal_is_reprojected_each_cycle_and_reached(self):
+        self.set_goal(forward_m=1.0, left_m=0.0)
+        self.start()
+        self.pump_until(lambda: self.node.snapshot().goal_reached, limit=600)
+        state = self.node.snapshot()
+        self.assertFalse(state.inference.enabled)
+        self.assertIn("Goal reached", state.status_message)
+        anchored = [e for e in self.executor.events if e["event"] == "goal_anchored"]
+        self.assertEqual(len(anchored), 1)
+        self.assertAlmostEqual(anchored[0]["world"][0], 1.0)
+        rows = [request.goal.y for request, _ in self.requests]
+        self.assertGreater(len(rows), 2)
+        self.assertEqual(rows, sorted(rows))  # The fixed goal moves down the image as the robot nears it.
+        self.assertLess(math.dist((self.executor.pose.x, self.executor.pose.y), (1.0, 0.0)),
+                        self.config.goal.arrival_tolerance_m + 0.2)
+        self.pump_until(lambda: self.executor.phase == "idle" and self.robot.state == "down")
+
+    def test_goal_behind_turns_in_place_before_the_first_observation(self):
+        self.set_goal(forward_m=-1.0, left_m=0.5)
+        self.start()
+        self.pump_until(lambda: self.requests, limit=600)
+        before_first_step = self.robot.velocities[:self.requests[0][1]]
+        self.assertTrue(any(v.vyaw > 0 for v in before_first_step))
+        self.assertTrue(all(v.vx == 0 for v in before_first_step))
+        self.assertAlmostEqual(self.executor.pose.yaw, math.atan2(0.5, -1.0), delta=0.1)
+        goal = self.requests[0][0].goal
+        self.assertTrue(0 <= goal.x < 1 and 0 <= goal.y < 1)
+
+    def test_image_goal_above_the_horizon_fails_without_moving(self):
+        self.set_goal(x=0.5, y=0.1)
+        self.start()
+        self.pump_until(lambda: self.executor.last_error is not None)
+        self.assertIn("not on visible ground", self.executor.last_error)
+        self.assertFalse(any(v != VelocityCommand() for v in self.robot.velocities))
+        self.assertFalse(self.node.snapshot().inference.enabled)
+
+    def test_go2_pose_source_uses_reported_odometry_or_refuses_without_it(self):
+        config = self.config.model_copy(update={"pose_source": "go2"})
+        self.executor = self.make_executor(config)
+        self.set_goal(forward_m=1.0, left_m=0.0)
+        self.start()
+        self.pump_until(lambda: self.node.snapshot().cycle.completed >= 1)
+        self.assertAlmostEqual(self.executor.pose.x, self.robot.x, places=6)
+        self.node.receive_command(ControlCommand(type="stop"))
+        self.pump_until(lambda: self.executor.phase == "idle" and self.robot.state == "down")
+
+        self.robot.publish_pose = False
+        self.executor = self.make_executor(config)
+        for _ in range(3):
+            self.pump()
+        self.start()
+        self.pump_until(lambda: self.executor.last_error is not None)
+        self.assertIn("no position/yaw", self.executor.last_error)
 
 
 class ExecutorConfigTests(unittest.TestCase):
