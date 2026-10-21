@@ -235,7 +235,12 @@ class Go2StepExecutor:
         return self.go2 is not None and now - self.go2_at <= self.config.go2.state_timeout_seconds
 
     def _go2_available(self, now):
-        return self._go2_fresh(now) and self.go2.robot_connected and self.go2.accepting_commands
+        # Like NaVILA: intake closes briefly after every posture RPC, so
+        # accepting_commands only gates sending, not availability.
+        return self._go2_fresh(now) and self.go2.robot_connected
+
+    def _go2_accepting(self, now):
+        return self._go2_available(now) and self.go2.accepting_commands
 
     def _resting(self):
         state = self.go2.robot_state
@@ -261,6 +266,8 @@ class Go2StepExecutor:
             self._event("error", message=message)
         self.phase, self.error = "error", message
         self._clear_step()
+        if self._posture_pending == "stand":
+            self._posture_pending = None  # Never stand up after a failure.
 
     def _clear_step(self):
         self._pending = self._step = self._turn = None
@@ -279,7 +286,7 @@ class Go2StepExecutor:
 
     def _finish_stop(self, error, rested):
         self.phase, self.error, self.last_error = "idle", None, error
-        self._rest_deadline = None
+        self._rest_deadline, self._posture_pending = None, None
         self._event("stopped", error=error, rested=rested)
         if not rested:
             LOGGER.warning("Stop finished without confirmed rest: %s", error)
@@ -499,7 +506,7 @@ class Go2StepExecutor:
             self.command = VelocityCommand()
             return
         if not self._go2_available(now):
-            return self._fail("Go2 state is stale, disconnected or not accepting commands")
+            return self._fail("Go2 state is stale or disconnected")
         if not self._pose_valid:
             return self._fail("Go2 state has no position/yaw; use pose_source dead_reckoning")
         self._startup_rest_checked = True
@@ -510,6 +517,8 @@ class Go2StepExecutor:
                 self.phase, self._posture_pending = "standing", "stand"
                 self._stand_deadline = now + self.config.go2.stand_timeout_seconds
                 self._event("stand_requested")
+            elif self.go2.robot_state.state == "unknown" or self.go2.robot_state.motion != "quiescent":
+                return  # Settling after a posture RPC; the node's stop timeout bounds the wait.
             else:
                 return self._fail(f"Go2 is not in a startable posture: {self.go2.robot_state.state}")
         if self.phase == "standing":
@@ -544,7 +553,10 @@ class Go2StepExecutor:
         elif (self.phase in ("holding", "turning", "moving", "settling")
                 or (self.phase == "error" and self._standing_now(now))):
             velocity = self.command
-        posture, self._posture_pending = self._posture_pending, None
+        posture = None
+        if self._posture_pending is not None and self._go2_accepting(now):
+            # Held until intake is open: the Go2 node drops commands while it is closed.
+            posture, self._posture_pending = self._posture_pending, None
         return ExecutorOutput(velocity, posture, self._feedback(now))
 
     def _standing_now(self, now):
@@ -569,7 +581,7 @@ class Go2StepExecutor:
         elif self.phase == "idle" and self._go2_available(now) and self.go2.robot_state.motion == "quiescent":
             motion, message = "stopped", "idle; start stands the robot first"
         elif self.phase == "idle" and not self._go2_available(now):
-            motion, message = "error", "Go2 state is stale, disconnected or not accepting commands"
+            motion, message = "error", "Go2 state is stale or disconnected"
         else:
             motion, message = "settling", self.phase
         report = self._goal_report if motion == "stopped" and self.phase == "holding" else None

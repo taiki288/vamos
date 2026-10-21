@@ -33,11 +33,18 @@ VELOCITY_TIMEOUT_SECONDS = 0.25
 
 
 class SimulatedGo2:
-    def __init__(self, state="down", posture_seconds=1.0, clock=time.monotonic, publish_pose=True):
+    """Like unitree-go2-zenoh-node, a posture command closes command intake and
+    reports state "unknown" until an observation after the SDK call
+    (`awaiting_seconds` here); commands received while intake is closed are dropped."""
+
+    def __init__(self, state="down", posture_seconds=1.0, clock=time.monotonic, publish_pose=True,
+                 awaiting_seconds=0.15):
         self.state, self.motion = state, "quiescent"
         self.publish_pose = publish_pose
         self.posture_seconds, self.clock = posture_seconds, clock
+        self.awaiting_seconds, self.awaiting_until = awaiting_seconds, -math.inf
         self.connected = self.accepting = True
+        self.dropped_commands = 0
         self.transition: tuple[str, float] | None = None
         self.velocity = (0.0, 0.0, 0.0)
         self.velocity_at = -math.inf
@@ -46,13 +53,20 @@ class SimulatedGo2:
         self.last_step: float | None = None
         self.lock = RLock()
 
+    def intake_open(self, now):
+        return self.connected and self.accepting and now >= self.awaiting_until
+
     def receive(self, message: dict, now: float | None = None):
         now = self.clock() if now is None else now
         with self.lock:
+            if not self.intake_open(now):
+                self.dropped_commands += 1
+                return
             if message.get("type") == "posture" and message.get("posture") in ("stand", "down"):
                 target = "ready_stand" if message["posture"] == "stand" else "down"
                 if target != self.state:
                     self.velocity, self.transition = (0.0, 0.0, 0.0), (target, now + self.posture_seconds)
+                    self.awaiting_until = now + self.awaiting_seconds
             elif message.get("type") == "velocity" and self.state in STANDING and self.transition is None:
                 self.velocity = tuple(float(message[name]) for name in ("vx", "vy", "vyaw"))
                 self.velocity_at = now
@@ -77,11 +91,14 @@ class SimulatedGo2:
                 self.state, self.transition = self.transition[0], None
             moving = self.transition is not None or self.velocity != (0.0, 0.0, 0.0)
             self.motion = "moving" if moving else "quiescent"
-            robot_state = {"state": self.state, "motion": self.motion, "velocity": [vx, vy, 0.0], "yaw_speed": vyaw}
+            awaiting = now < self.awaiting_until
+            robot_state = {"state": "unknown" if awaiting else self.state,
+                           "motion": "unknown" if awaiting else self.motion,
+                           "velocity": [vx, vy, 0.0], "yaw_speed": vyaw}
             if self.publish_pose:  # The proposed odometry fields.
                 robot_state.update(position=[self.x, self.y, 0.0], yaw=self.yaw)
             return {"lifecycle": "running", "robot_connected": self.connected,
-                    "accepting_commands": self.accepting and self.connected, "simulated": True,
+                    "accepting_commands": self.intake_open(now), "simulated": True,
                     "robot_state": robot_state}
 
 

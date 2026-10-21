@@ -210,6 +210,24 @@ class Go2ExecutorTests(ExecutorHarness, unittest.TestCase):
         self.assertTrue(executor.shutdown_complete)
         self.assertIn("unavailable", executor.shutdown_error)
 
+    def test_postures_wait_for_open_intake_and_stand_is_never_sent_after_failure(self):
+        self.robot.accepting = False  # Intake stays closed: the stand request cannot be delivered.
+        self.start()
+        self.pump_until(lambda: self.executor.last_error is not None, limit=300)
+        self.assertIn("standing state", self.executor.last_error)
+        self.assertEqual(self.robot.postures, [])  # No posture was sent into the closed intake.
+        self.robot.accepting = True
+        for _ in range(20):
+            self.pump()
+        self.assertNotIn("stand", self.robot.postures)
+
+    def test_intake_window_after_stand_is_waited_out(self):
+        self.robot.awaiting_seconds = 0.4  # Longer than several control periods.
+        self.start()
+        self.pump_until(lambda: self.node.snapshot().cycle.completed >= 1)
+        self.assertEqual(self.robot.postures, ["stand"])
+        self.assertIsNone(self.executor.last_error)
+
     def test_start_is_blocked_while_go2_state_is_missing(self):
         self.go2_fresh = False
         for _ in range(15):
