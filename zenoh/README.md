@@ -36,6 +36,7 @@ Development and setup tools live in `tools/`:
 | `tools/fake_camera.py` | Publishes one test image as the camera stream |
 | `tools/fake_go2.py` | Simulated Go2 node (same Zenoh contract, plus the proposed position/yaw; `--no-pose` omits them) with an optional 2D view |
 | `tools/viewer.py` | Shows `vamos/preview` |
+| `tools/watch_go2.py` | Prints Go2 state and odometry change since start (read-only), for hardware checks |
 | `tools/calibrate_camera.py` | Camera intrinsics, mount and verification for ground projection |
 | `tools/projection_demo.py` | One saved or live inference projected to the ground, with the executor's selection |
 
