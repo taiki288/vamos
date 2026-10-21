@@ -300,6 +300,31 @@ class GoalTests(ExecutorHarness, unittest.TestCase):
         self.assertIn("no position/yaw", self.executor.last_error)
 
 
+# robot_state as published by unitree-go2-zenoh-node with the odometry change
+# (generated from that node's own controller), pinned as a contract fixture.
+GO2_NODE_STATE = (
+    '{"lifecycle":"running","robot_connected":true,"robot_state":{"state":"ready_stand","reason":null,'
+    '"motion":"quiescent","state_machine_code":1,"state_machine_name":"balance_standing","mode":1,'
+    '"mode_name":"balance_stand","velocity":[0.0,0.0,0.0],"yaw_speed":0.0,"position":[1.0,-2.0,0.3],'
+    '"yaw":1.5,"stamp_sec":12,"stamp_nanosec":34},"accepting_commands":true,"requested_posture":null,'
+    '"requested_velocity":null,"last_posture_action":null,"last_sdk_diagnostic":null,"last_node_error":null}')
+
+
+class Go2ContractTests(unittest.TestCase):
+    def test_go2_node_odometry_drives_the_go2_pose_source(self):
+        state = Go2NodeState.model_validate_json(GO2_NODE_STATE)
+        self.assertEqual((state.robot_state.position, state.robot_state.yaw), ((1.0, -2.0, 0.3), 1.5))
+        executor = Go2StepExecutor(ExecutorConfig(camera_calibration="unused.json", allow_assumed_calibration=True,
+                                                  pose_source="go2"),
+                                   NodeConfig.model_validate(CONFIG).inference.stop_go, CAMERA, clock=lambda: 10.0)
+        executor.receive_go2_state(state)
+        executor.tick(10.0)
+        self.assertEqual((executor.pose.x, executor.pose.y, executor.pose.yaw), (1.0, -2.0, 1.5))
+        unknown = json.loads(GO2_NODE_STATE)
+        unknown["robot_state"].update(state="unknown", motion="unknown", position=None, yaw=None)
+        self.assertIsNone(Go2NodeState.model_validate(unknown).robot_state.position)
+
+
 class ExecutorConfigTests(unittest.TestCase):
     def test_assumed_calibration_requires_explicit_opt_in(self):
         with tempfile.TemporaryDirectory() as directory:

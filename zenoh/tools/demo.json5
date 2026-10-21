@@ -28,5 +28,6 @@
   executor: {
     camera_calibration: "../ground-camera.example.json",
     allow_assumed_calibration: true,
+    pose_source: "go2", // fake_go2.py publishes robot_state.position/yaw like the patched Go2 node.
   },
 }

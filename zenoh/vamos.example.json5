@@ -61,7 +61,8 @@
     // Relative to this file. Refused unless calibration_status is "calibrated".
     camera_calibration: "ground-camera.json",
     allow_assumed_calibration: false, // Set true only for robot-free tests.
-    // "go2": robot_state.position/yaw from the Go2 node (proposed fields).
+    // "go2": the robot's own odometry, robot_state.position/yaw (needs a Go2 node
+    //   that publishes them: SportModeState.position and imu_state.rpy[2]).
     // "dead_reckoning": integrate this executor's own commands; drifts over long runs.
     pose_source: "dead_reckoning",
     selection: "medoid", // "medoid" or "index" (uses candidate_index).

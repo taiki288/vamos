@@ -116,11 +116,15 @@ Do these in order; each step can be checked without the next one.
 3. **Robot-free run with real inputs**: camera node + Go2 node with the robot
    resting (or the Go2 node alone), VAMOS node, CLI, viewer. Check `status`:
    camera fresh, Go2 fresh, `start_ready` only once an executor reports.
-4. **Executor dry run**: start `go2_executor.py` with the Go2 node connected but
+4. **Odometry check** (with `executor.pose_source: "go2"`): turn the robot about
+   90° by hand or with the keyboard example, walk it forward, and confirm that
+   `robot_state.position` moves along the reported `yaw`. Goals are anchored in
+   that frame, so a mismatch misplaces every goal.
+5. **Executor dry run**: start `go2_executor.py` with the Go2 node connected but
    the robot supported or lifted; confirm `stand` on `start`, zero velocity while
    observing/inferring, one bounded step, and `down` on `stop`, heartbeat loss
    (kill the CLI) and executor Ctrl+C.
-5. **Powered trials**: low speeds, short steps, open floor.
+6. **Powered trials**: low speeds, short steps, open floor.
 
 Processes, each from the repository root, all reading `zenoh/vamos.json5`:
 
@@ -133,9 +137,10 @@ uv run --group zenoh python zenoh/tools/viewer.py
 
 The executor refuses a calibration that is not `calibrated` unless
 `executor.allow_assumed_calibration` is true (robot-free tests only). Use
-`executor.pose_source: "go2"` once the Go2 node publishes
-`robot_state.position`/`yaw`; until then `"dead_reckoning"` drifts with
-distance, so keep goals short.
+`executor.pose_source: "go2"` (the robot's own odometry, as the original VAMOS
+uses Spot's) with a Go2 node that publishes `robot_state.position`/`yaw` from
+`SportModeState.position` and `imu_state.rpy[2]`; until then
+`"dead_reckoning"` drifts with distance, so keep goals short.
 
 ## Operator CLI
 
