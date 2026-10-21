@@ -1,0 +1,83 @@
+// VAMOS settings for a real Go2. Copy to zenoh/vamos.json5 (ignored by Git) and
+// edit; every process reads it with --config (default zenoh/vamos.json5).
+// The robot-free demo uses zenoh/tools/demo.json5 instead.
+{
+  // Zenoh keys shared with camera-zenoh-node and unitree-go2-zenoh-node.
+  keys: {
+    prefix: "vamos",
+    camera: "camera/front",
+    go2_prefix: "unitree/go2",
+  },
+
+  // Zenoh session configs, passed to Zenoh as-is. node.py listens; every other
+  // process connects. Across machines, listen on the node host's LAN address
+  // and connect to it from everywhere (the same file then works on all hosts).
+  zenoh: {
+    node: {
+      mode: "peer",
+      listen: { endpoints: ["tcp/127.0.0.1:7447"] },
+      connect: { endpoints: [] },
+      scouting: { multicast: { enabled: false } },
+    },
+    client: {
+      mode: "client",
+      connect: { endpoints: ["tcp/127.0.0.1:7447"] },
+      scouting: { multicast: { enabled: false } },
+    },
+  },
+
+  // node.py
+  node: {
+    state_publish_frequency_hz: 10.0,
+    cli_heartbeat_timeout_seconds: 1.0,
+    camera_freshness_seconds: 2.5,
+    go2_state_timeout_seconds: 0.5,
+    inference: {
+      model_key: "mateoguaman/vamos",
+      device: "cuda", // "auto" or "cpu" may also be selected explicitly.
+      num_samples: 5,
+      max_new_tokens: 10,
+      temperature: 0.05,
+      disable_compile: true, // Predictable latency; compilation warm-up exceeded time budgets.
+      frequency_hz: 1.0, // How often the worker checks for an observation to infer.
+      shutdown_timeout_seconds: 30.0,
+      // Default goal: x/y image fractions, or forward_m/left_m. The CLI's goal,
+      // goal_m and ins commands change it at run time.
+      goal: { forward_m: 2.0, left_m: 0.0, instruction: "" },
+      stop_go: {
+        max_step_seconds: 1.0,
+        max_step_distance_m: 0.2,
+        max_step_yaw_rad: 0.35,
+        stop_settle_seconds: 0.2,
+        stop_confirm_timeout_seconds: 15.0, // Covers stand-up and turning toward the goal.
+        observation_delay_seconds: 0.2, // Camera latency margin after stopped feedback.
+        inference_timeout_seconds: 60.0,
+      },
+    },
+  },
+
+  // go2_executor.py
+  executor: {
+    // Relative to this file. Refused unless calibration_status is "calibrated".
+    camera_calibration: "ground-camera.json",
+    allow_assumed_calibration: false, // Set true only for robot-free tests.
+    // "go2": robot_state.position/yaw from the Go2 node (proposed fields).
+    // "dead_reckoning": integrate this executor's own commands; drifts over long runs.
+    pose_source: "dead_reckoning",
+    selection: "medoid", // "medoid" or "index" (uses candidate_index).
+    control_frequency_hz: 20.0, // Go2 drops velocity after 0.25 s without a refresh.
+    goal: {
+      arrival_tolerance_m: 0.5, // Also reached once the goal is in the camera's near blind zone.
+    },
+    motion: {
+      forward_speed_mps: 0.3,
+      max_yaw_rate_rps: 0.6,
+    },
+  },
+
+  // cli.py
+  cli: {
+    heartbeat_interval_seconds: 0.2,
+    command_timeout_seconds: 15.0,
+  },
+}

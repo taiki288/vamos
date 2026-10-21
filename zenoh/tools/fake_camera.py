@@ -20,14 +20,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PIL import Image
 import zenoh
 
-from config import JPEG_ENCODING, JSON_ENCODING, NodeState, load_node_config
+from config import DEFAULT_CONFIG_PATH, JPEG_ENCODING, JSON_ENCODING, NodeState, load_config
 from node import HERE, has_encoding, stop_on_signals
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--node-config", type=Path, default=HERE / "node-config.example.json5")
-    parser.add_argument("--zenoh-config", type=Path, default=HERE / "peer-zenoh-config.example.json5")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Settings file (default zenoh/vamos.json5)")
     parser.add_argument("--image", type=Path, default=HERE.parent / "test_images/texas_person.jpg")
     parser.add_argument("--frequency-hz", type=float, default=5.0)
     parser.add_argument("--heartbeat", action="store_true", help="Also send operator heartbeat (no CLI running)")
@@ -36,7 +35,8 @@ def main() -> int:
         parser.error("--frequency-hz must be finite and positive")
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     try:
-        keys = load_node_config(args.node_config).keys()
+        config = load_config(args.config)
+        keys = config.node_config().keys()
         with Image.open(args.image) as source:
             buffer = BytesIO()
             source.convert("RGB").save(buffer, format="JPEG", quality=90)
@@ -50,7 +50,7 @@ def main() -> int:
                 except ValueError as error:
                     logging.warning("Invalid VAMOS state: %s", error)
 
-        with stop_on_signals() as stop, zenoh.open(zenoh.Config.from_file(str(args.zenoh_config))) as session, \
+        with stop_on_signals() as stop, zenoh.open(config.zenoh.session("client")) as session, \
                 ExitStack() as resources:
             resources.enter_context(session.declare_subscriber(keys["state"], on_state))
             camera = resources.enter_context(session.declare_publisher(keys["camera"], encoding=JPEG_ENCODING))

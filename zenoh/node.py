@@ -23,7 +23,7 @@ from PIL import Image
 
 from config import (
     CameraState, ControlAck, ControlCommand, CycleState, ExecutorState, GoalConfig, Go2NodeState, Go2State, JPEG_ENCODING,
-    JSON_ENCODING, InferenceState, NodeConfig, NodeState, TrajectoryResult, load_node_config,
+    JSON_ENCODING, InferenceState, NodeConfig, NodeState, TrajectoryResult, DEFAULT_CONFIG_PATH, load_config,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -640,14 +640,13 @@ def tolerate_unencodable_output():
 def main() -> int:
     tolerate_unencodable_output()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--node-config", type=Path, default=HERE / "node-config.example.json5")
-    parser.add_argument("--zenoh-config", type=Path, default=HERE / "zenoh-config.example.json5")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Settings file (default zenoh/vamos.json5)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     try:
-        config = load_node_config(args.node_config)
+        config = load_config(args.config)
         with stop_on_signals() as stop:
-            NodeRuntime(config).run(zenoh.Config.from_file(str(args.zenoh_config)), stop)
+            NodeRuntime(config.node_config()).run(config.zenoh.session("node"), stop)
     except (OSError, ValueError, RuntimeError, zenoh.ZError) as error:
         LOGGER.error("%s", error)
         return 1

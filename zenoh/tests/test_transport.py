@@ -14,8 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PIL import Image
 from pydantic import ValidationError
 
-from config import ControlCommand, Go2NodeState, NodeConfig, load_node_config
-from node import NodeRuntime, TransportState
+from config import DEMO_CONFIG_PATH, EXAMPLE_CONFIG_PATH, ControlCommand, Go2NodeState, NodeConfig, load_config
+from node import NodeRuntime
 
 
 BASE_CONFIG = {
@@ -62,11 +62,34 @@ class TransportTests(unittest.TestCase):
         self.config = NodeConfig.model_validate(BASE_CONFIG)
         self.runtime = NodeRuntime(self.config, clock=lambda: self.now)
 
-    def test_defaults_load_and_keys_match_existing_nodes(self):
-        config = load_node_config(Path(__file__).resolve().parents[1] / "node-config.example.json5")
-        self.assertEqual(config.keys()["camera"], "camera/front")
-        self.assertEqual(config.keys()["go2_state"], "unitree/go2/state")
-        self.assertEqual(config.keys()["state"], "vamos/state")
+    def test_settings_files_load_and_keys_match_existing_nodes(self):
+        for path in (EXAMPLE_CONFIG_PATH, DEMO_CONFIG_PATH):
+            with self.subTest(path=path.name):
+                settings = load_config(path)
+                keys = settings.node_config().keys()
+                self.assertEqual(keys["camera"], "camera/front")
+                self.assertEqual(keys["go2_state"], "unitree/go2/state")
+                self.assertEqual(keys["state"], "vamos/state")
+                self.assertTrue(Path(settings.executor.camera_calibration).is_absolute())
+                settings.zenoh.session("node"), settings.zenoh.session("client")
+        self.assertFalse(load_config(EXAMPLE_CONFIG_PATH).executor.allow_assumed_calibration)
+        self.assertTrue(load_config(DEMO_CONFIG_PATH).executor.allow_assumed_calibration)
+
+    def test_settings_file_is_validated_as_a_whole(self):
+        import json
+        import tempfile
+
+        base = {"zenoh": {"node": {"mode": "peer"}, "client": {"mode": "client"}},
+                "node": {"inference": {"goal": {"x": 0.5, "y": 0.5}}}, "executor": {"camera_calibration": "c.json"}}
+        for name, change in (("unknown section", {"extra": {}}),
+                             ("bad zenoh", {"zenoh": {"node": {"mode": "nonsense"}, "client": {"mode": "client"}}}),
+                             ("heartbeat", {"cli": {"heartbeat_interval_seconds": 2.0}}),
+                             ("key collision", {"keys": {"camera": "vamos/state"}})):
+            with self.subTest(name), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "vamos.json5"
+                path.write_text(json.dumps({**base, **change}), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    load_config(path)
 
     def test_goal_is_either_an_image_point_or_a_metric_offset(self):
         from config import GoalConfig

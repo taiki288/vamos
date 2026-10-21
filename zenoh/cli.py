@@ -14,7 +14,8 @@ from uuid import uuid4
 
 import zenoh
 
-from config import ControlCommand, GoalConfig, JSON_ENCODING, NodeState, load_node_config
+from config import (DEFAULT_CONFIG_PATH, DEMO_CONFIG_PATH, ControlCommand, GoalConfig, JSON_ENCODING, NodeState,
+                    load_config)
 from node import HERE, has_encoding
 from launcher import ManagedProcesses, check_listener_available, listener_addresses
 
@@ -167,8 +168,7 @@ class CliRuntime:
     def start(self):
         state = self.state()
         if state.stage != "inference":
-            raise ValueError("Connected node is transport-only; restart it with "
-                             "--node-config zenoh/inference-node-config.example.json5")
+            raise ValueError("Connected node has no inference settings")
         if state.inference.enabled:
             self.output("Inference is already enabled.")
             return state
@@ -318,18 +318,14 @@ class CliRuntime:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--node-config", type=Path, default=HERE / "inference-node-config.example.json5")
-    parser.add_argument("--zenoh-config", type=Path, default=HERE / "peer-zenoh-config.example.json5")
-    parser.add_argument("--heartbeat-interval", type=float, default=0.2)
-    parser.add_argument("--state-timeout", type=float, default=1)
-    parser.add_argument("--command-timeout", type=float, default=15)
+    parser.add_argument("--config", type=Path,
+                        help="Settings file (default zenoh/vamos.json5, or zenoh/tools/demo.json5 with --demo)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--demo", action="store_true",
                       help="Robot-free demo: test camera, simulated Go2 and go2_executor.py with the demo config")
     mode.add_argument("--attach", action="store_true", help="Connect to an already running node instead of launching one")
     parser.add_argument("--viewer", action="store_true", help="Open the image-space path viewer")
     parser.add_argument("--simulator", action="store_true", help="Open the simulated Go2 window (requires --demo)")
-    parser.add_argument("--node-zenoh-config", type=Path, default=HERE / "zenoh-config.example.json5")
     parser.add_argument("--image", type=Path, help="Demo image override (requires --demo)")
     parser.add_argument("--log-dir", type=Path, default=HERE.parent / "outputs/cli")
     args = parser.parse_args()
@@ -337,31 +333,30 @@ def main() -> int:
         parser.error("--image and --simulator require --demo")
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     try:
-        config = load_node_config(args.node_config)
-        if not args.attach and config.inference is None:
-            raise ValueError("Local startup requires a node configuration with inference settings")
+        config_path = (args.config or (DEMO_CONFIG_PATH if args.demo else DEFAULT_CONFIG_PATH)).resolve()
+        settings = load_config(config_path)
+        config = settings.node_config()
         with ManagedProcesses(args.log_dir,
-                shutdown_timeout=5 + (config.inference.shutdown_timeout_seconds if config.inference else 30)) as processes:
-            runtime = CliRuntime(config, heartbeat_interval=args.heartbeat_interval, state_timeout=args.state_timeout,
-                                 command_timeout=args.command_timeout, processes=processes)
-            shared = ("--node-config", args.node_config.resolve(), "--zenoh-config", args.zenoh_config.resolve())
+                shutdown_timeout=5 + config.inference.shutdown_timeout_seconds) as processes:
+            runtime = CliRuntime(config, heartbeat_interval=settings.cli.heartbeat_interval_seconds,
+                                 state_timeout=settings.cli.state_timeout_seconds,
+                                 command_timeout=settings.cli.command_timeout_seconds, processes=processes)
+            shared = ("--config", config_path)
             if not args.attach:
-                addresses = listener_addresses(args.node_zenoh_config)
+                addresses = listener_addresses(settings.zenoh.node)
                 check_listener_available(addresses)
-                processes.start("node", HERE / "node.py", "--node-config", args.node_config.resolve(),
-                                "--zenoh-config", args.node_zenoh_config.resolve())
+                processes.start("node", HERE / "node.py", *shared)
                 processes.wait_for_listener(addresses)
             if args.demo:
                 # The CLI owns heartbeat. The executor is the real one, driving a simulated Go2.
                 tools = HERE / "tools"
-                camera_args = [*shared, *(("--image", args.image.resolve()) if args.image else ())]
-                processes.start("camera", tools / "fake_camera.py", *camera_args)
+                processes.start("camera", tools / "fake_camera.py", *shared,
+                                *(("--image", args.image.resolve()) if args.image else ()))
                 processes.start("go2", tools / "fake_go2.py", *shared, *(() if args.simulator else ("--headless",)))
-                processes.start("executor", HERE / "go2_executor.py", *shared,
-                                "--executor-config", tools / "demo-executor-config.json5")
+                processes.start("executor", HERE / "go2_executor.py", *shared)
             if args.viewer:
                 processes.start("viewer", HERE / "tools" / "viewer.py", *shared)
-            runtime.run(zenoh.Config.from_file(str(args.zenoh_config)))
+            runtime.run(settings.zenoh.session("client"))
         return 0
     except KeyboardInterrupt:
         return 130

@@ -8,7 +8,6 @@ shows which one go2_executor.py would choose and why. Nothing moves.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import json
 import math
 from pathlib import Path
@@ -19,19 +18,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PIL import Image
 
-from config import TrajectoryResult, load_node_config
+from config import DEFAULT_CONFIG_PATH, InferenceConfig, TrajectoryResult, load_config
 from projection import GroundCamera, GroundProjector
 from selection import Selection, select_candidate
 
 ZENOH = Path(__file__).resolve().parents[1]
 
 
-def infer_once(image: Image.Image, config_path: Path) -> TrajectoryResult:
+def infer_once(image: Image.Image, config: InferenceConfig) -> TrajectoryResult:
     from inference import VAMOSEngine  # Replay never imports torch.
 
-    config = load_node_config(config_path).inference
-    if config is None:
-        raise ValueError("node configuration must include inference settings")
     engine = VAMOSEngine.load(config)
     started = time.monotonic()
     output = engine.infer(image)
@@ -85,9 +81,11 @@ def comparison_figure(image, result: TrajectoryResult, camera: GroundCamera, sel
 def run(args) -> int:
     with Image.open(args.image) as source:
         image = source.convert("RGB")
-    camera = GroundCamera.load(args.camera)
+    # The settings file is only needed for live inference or the default calibration.
+    settings = load_config(args.config) if args.infer or args.camera is None else None
+    camera = GroundCamera.load(args.camera or Path(settings.executor.camera_calibration))
     camera.check_image_size(*image.size)
-    result = (infer_once(image, args.inference_config) if args.infer else
+    result = (infer_once(image, settings.node.inference) if args.infer else
               TrajectoryResult.model_validate_json(args.result.read_text(encoding="utf-8")))
     camera.check_image_size(result.image_width, result.image_height)
     selection = select_candidate(result.trajectories, GroundProjector(camera),
@@ -127,8 +125,9 @@ def main() -> int:
     mode.add_argument("--infer", action="store_true", help="Run one real VAMOS inference")
     mode.add_argument("--result", type=Path, help="Replay a saved TrajectoryResult JSON for this exact image")
     parser.add_argument("--image", type=Path, default=ZENOH.parent / "test_images/texas_person.jpg")
-    parser.add_argument("--camera", type=Path, default=ZENOH / "ground-camera.example.json")
-    parser.add_argument("--inference-config", type=Path, default=ZENOH / "inference-node-config.example.json5")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH,
+                        help="Settings file for --infer and the default calibration (default zenoh/vamos.json5)")
+    parser.add_argument("--camera", type=Path, help="Calibration file instead of the settings file's")
     parser.add_argument("--candidate", type=int, help="Fixed candidate index instead of the medoid")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--output-dir", type=Path, help="Save source, input JSON, report and plot")

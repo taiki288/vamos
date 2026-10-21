@@ -15,7 +15,7 @@ the camera and robot bridges are separate projects:
 > `go2_executor.py` moves a real robot. Validate robot-free first, support the
 > Go2 for the first powered trials, keep the remote at hand and agree on an
 > emergency stop beforehand. Run exactly one executor, and never run
-> `tools/fake_go2.py` or `tools/demo-executor-config.json5` with a real robot.
+> `tools/fake_go2.py` or `tools/demo.json5` with a real robot.
 
 ## Components
 
@@ -50,9 +50,29 @@ Development and setup tools live in `tools/`:
 | `vamos/preview` | `image/jpeg` | node → viewer |
 | `vamos/executor/state` | `application/json` stop/move feedback and current step path | executor → node |
 
-All keys are concrete (no wildcards) and configurable. Every runtime file named
-`zenoh/*.json5` / `zenoh/ground-camera.json` is ignored by Git; copy the tracked
-`*.example.*` files to create them.
+All keys are concrete (no wildcards) and configurable.
+
+## Settings
+
+Every process reads **one** JSON5 file and uses its own sections:
+
+| File | Use |
+| --- | --- |
+| `zenoh/vamos.json5` | Your robot settings, copied from the tracked `zenoh/vamos.example.json5` (ignored by Git). The default for every process. |
+| `zenoh/tools/demo.json5` | Robot-free demo; `cli.py --demo` uses it automatically. |
+| `zenoh/ground-camera.json` | Camera calibration, written by `tools/calibrate_camera.py` and named by `executor.camera_calibration` (ignored by Git). |
+
+```console
+cp zenoh/vamos.example.json5 zenoh/vamos.json5
+```
+
+Sections: `keys` (Zenoh keys), `zenoh` (session configs passed to Zenoh as-is:
+`node` listens, `client` is used by every other process), `node`, `executor`
+and `cli`. Pass another file with `--config` to any process. Unknown fields,
+wrong types, key collisions and invalid Zenoh configs are rejected at startup;
+a missing `zenoh/vamos.json5` is reported with the copy command. Copy the same
+file to every machine: point `zenoh.client` (and the node's `listen`) at the
+node host's LAN address.
 
 ## Quick start: robot-free demo
 
@@ -65,7 +85,7 @@ uv run --group zenoh python zenoh/cli.py --demo --viewer --simulator
 
 This starts the inference node, a test camera, a simulated Go2 (window with
 `--simulator`), the **real** `go2_executor.py` with
-`tools/demo-executor-config.json5`, and the preview viewer. Enter `status`, then
+the demo settings, and the preview viewer. Enter `status`, then
 `start` once `model_loaded=True` and `start_ready=True`: the executor stands the
 simulated Go2, anchors the example goal on the ground, runs one bounded step per
 inference until the goal is reached, and lays the robot down. Try `goal_m 2 1`
@@ -74,8 +94,8 @@ or `goal_m -1 0.5` (behind: the robot turns first) and `start` again.
 started (the executor first, so it can rest the robot); their logs are under
 `outputs/cli` (`logs`, `processes`).
 
-Use `--node-config zenoh/ground-inference-node-config.example.json5 --image
-test_images/texas_ground.jpg` for the second bundled image. The camera image
+For the second bundled image, add `--image test_images/texas_ground.jpg` and set a
+goal on its path at the prompt (for example `goal 0.5 0.6`). The camera image
 never changes as the simulated robot moves: the demo exercises the protocol,
 selection and executor, not perception, metric accuracy or obstacle clearance.
 
@@ -102,23 +122,20 @@ Do these in order; each step can be checked without the next one.
    (kill the CLI) and executor Ctrl+C.
 5. **Powered trials**: low speeds, short steps, open floor.
 
-Processes, each from the repository root (copy the example configs first):
+Processes, each from the repository root, all reading `zenoh/vamos.json5`:
 
 ```console
-uv run --group zenoh python zenoh/node.py --node-config zenoh/inference-node-config.json5 --zenoh-config zenoh/zenoh-config.json5
-uv run --group zenoh python zenoh/go2_executor.py --node-config zenoh/inference-node-config.json5 --executor-config zenoh/go2-executor-config.json5 --zenoh-config zenoh/peer-zenoh-config.json5
-uv run --group zenoh python zenoh/cli.py --attach --node-config zenoh/inference-node-config.json5 --zenoh-config zenoh/peer-zenoh-config.json5
+uv run --group zenoh python zenoh/node.py
+uv run --group zenoh python zenoh/go2_executor.py
+uv run --group zenoh python zenoh/cli.py --attach
 uv run --group zenoh python zenoh/tools/viewer.py
 ```
 
-The executor reads the node config for keys and step bounds, and its own
-`go2-executor-config.json5` for calibration, candidate selection, speeds and
-timeouts. It refuses a calibration that is not `calibrated` unless
-`allow_assumed_calibration: true` (robot-free tests only), and refuses a node
-config without an `inference` section. Use `pose_source: "go2"` once the Go2
-node publishes `robot_state.position`/`yaw`; until then `"dead_reckoning"`
-drifts with distance, so keep goals short. For several computers, edit the
-listen/connect endpoints so every process reaches the node's listener.
+The executor refuses a calibration that is not `calibrated` unless
+`executor.allow_assumed_calibration` is true (robot-free tests only). Use
+`executor.pose_source: "go2"` once the Go2 node publishes
+`robot_state.position`/`yaw`; until then `"dead_reckoning"` drifts with
+distance, so keep goals short.
 
 ## Operator CLI
 
@@ -261,36 +278,39 @@ reported; an unusable selection is never silently replaced. The executor logs
 the chosen index, reason and per-candidate report for every step. This is not
 obstacle detection.
 
-## Configuration reference
+## Settings reference
 
-Node (`*inference-node-config.example.json5`):
+Only `zenoh`, `node.inference.goal` and `executor.camera_calibration` are
+required; everything else has a default (see `config.py`), and
+`vamos.example.json5` lists the settings most often changed.
 
 | Setting | Meaning |
 | --- | --- |
-| `camera.frame_freshness_seconds`, `cli_heartbeat_timeout_seconds` | Input freshness; expiry pauses the run |
-| `go2.node_state_timeout_seconds` | Go2 freshness shown in node state |
-| `inference.num_samples`, `max_new_tokens`, `temperature`, `disable_compile` | VAMOS generation |
-| `inference.goal` | Default goal: `x`/`y` image fractions or `forward_m`/`left_m`, plus instruction |
-| `inference.stop_go.max_step_seconds` / `max_step_distance_m` / `max_step_yaw_rad` | Step bounds |
-| `inference.stop_go.stop_settle_seconds` | Required quiescent standing time before `stopped` |
-| `inference.stop_go.stop_confirm_timeout_seconds` | Wait for `stopped`, including stand-up |
-| `inference.stop_go.observation_delay_seconds` | Camera latency margin after `stopped` |
-| `inference.stop_go.observation_pose_tolerance_m` / `_rad` | Pose noise allowed while observing/inferring |
-| `inference.stop_go.image_wait_timeout_seconds`, `inference_timeout_seconds`, `movement_timeout_seconds`, `executor_timeout_seconds` | Phase and feedback timeouts |
-
-Executor (`go2-executor-config.example.json5`): `camera_calibration`,
-`allow_assumed_calibration`, `pose_source`, `goal.arrival_tolerance_m`,
-`goal.turn_tolerance_rad`, `selection`/`candidate_index`/`min_path_length_m`,
-`control_frequency_hz`, `node_state_timeout_seconds`, `result_validity_seconds`,
-`shutdown_timeout_seconds`, `go2.{state,stand,down}_timeout_seconds`, and
-`motion` (Pure Pursuit speeds, lookahead, tolerances).
+| `keys.prefix`, `keys.camera`, `keys.go2_prefix` | `vamos/...`, the camera key, and the Go2 node prefix |
+| `zenoh.node`, `zenoh.client` | Zenoh session configs for the node's listener and for every other process |
+| `node.camera_freshness_seconds`, `node.cli_heartbeat_timeout_seconds`, `node.go2_state_timeout_seconds` | Input freshness; camera/heartbeat expiry pauses the run |
+| `node.inference.num_samples`, `max_new_tokens`, `temperature`, `disable_compile`, `device`, `model_key` | VAMOS generation |
+| `node.inference.goal` | Default goal: `x`/`y` image fractions or `forward_m`/`left_m`, plus instruction |
+| `node.inference.stop_go.max_step_seconds` / `max_step_distance_m` / `max_step_yaw_rad` | Step bounds |
+| `node.inference.stop_go.stop_settle_seconds` | Required quiescent standing time before `stopped` |
+| `node.inference.stop_go.stop_confirm_timeout_seconds` | Wait for `stopped`, including stand-up and turning |
+| `node.inference.stop_go.observation_delay_seconds` | Camera latency margin after `stopped` |
+| `node.inference.stop_go.observation_pose_tolerance_m` / `_rad` | Pose noise allowed while observing/inferring |
+| `node.inference.stop_go.image_wait_timeout_seconds`, `inference_timeout_seconds`, `movement_timeout_seconds`, `executor_timeout_seconds` | Phase and feedback timeouts |
+| `executor.camera_calibration`, `allow_assumed_calibration` | Calibration file (relative to the settings file) and the robot-free override |
+| `executor.pose_source` | `dead_reckoning` or `go2` |
+| `executor.goal.arrival_tolerance_m`, `turn_tolerance_rad` | Arrival and turn-in-place tolerances |
+| `executor.selection`, `candidate_index`, `min_path_length_m` | Candidate choice |
+| `executor.motion.*` | Pure Pursuit speeds (capped at 1.0 m/s, 1.5 rad/s), lookahead, tolerances |
+| `executor.control_frequency_hz`, `node_state_timeout_seconds`, `result_validity_seconds`, `shutdown_timeout_seconds`, `go2.{state,stand,down}_timeout_seconds` | Control rate and timeouts |
+| `cli.heartbeat_interval_seconds`, `state_timeout_seconds`, `command_timeout_seconds` | Operator CLI timing |
 
 ## Offline tools
 
 - `tools/projection_demo.py --infer` runs one real inference and shows every
   candidate on the ground with the executor's selection;
-  `--result ... --image ...` replays a saved result without a GPU.
-- `node.py` without an `inference` section is a transport diagnostic.
+  `--result ... --image ... --camera ...` replays a saved result without a GPU
+  or settings file.
 
 ## Tests
 

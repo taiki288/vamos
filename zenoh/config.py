@@ -1,14 +1,22 @@
-"""Transport settings and wire contracts, based on NaVILA's Zenoh node."""
+"""The single VAMOS settings file and the Zenoh wire contracts.
+
+Every process reads one JSON5 file (default `zenoh/vamos.json5`, copied from
+`zenoh/vamos.example.json5`) and uses its own sections. Camera calibration stays
+a separate, tool-generated file referenced from the executor section.
+"""
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import json5
 import zenoh
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator, model_validator
+
+from controller import PurePursuitConfig
 
 JSON_ENCODING = "application/json"
 JPEG_ENCODING = "image/jpeg"
@@ -339,6 +347,143 @@ class TrajectoryResult(Settings):
         return self
 
 
-def load_node_config(path: Path) -> NodeConfig:
+# --- The settings file --------------------------------------------------------------
+
+ZENOH = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = ZENOH / "vamos.json5"
+EXAMPLE_CONFIG_PATH = ZENOH / "vamos.example.json5"
+DEMO_CONFIG_PATH = ZENOH / "tools" / "demo.json5"
+
+
+class KeysConfig(Settings):
+    prefix: StrictStr = "vamos"
+    camera: StrictStr = "camera/front"
+    go2_prefix: StrictStr = "unitree/go2"
+
+    _keys = field_validator("prefix", "camera", "go2_prefix")(concrete_key)
+
+
+class ZenohConnections(Settings):
+    """Zenoh session configs, passed to Zenoh as-is: node listens, every other process connects."""
+
+    node: dict[str, Any]
+    client: dict[str, Any]
+
+    @field_validator("node", "client")
+    @classmethod
+    def valid_zenoh_config(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            zenoh.Config.from_json5(json.dumps(value))
+        except (zenoh.ZError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid Zenoh config: {error}") from error
+        return value
+
+    def session(self, role: Literal["node", "client"]) -> zenoh.Config:
+        return zenoh.Config.from_json5(json.dumps(getattr(self, role)))
+
+
+class NodeSettings(Settings):
+    state_publish_frequency_hz: PositiveSeconds = 10.0
+    cli_heartbeat_timeout_seconds: PositiveSeconds = 1.0
+    camera_freshness_seconds: PositiveSeconds = 2.5
+    go2_state_timeout_seconds: PositiveSeconds = 0.5
+    inference: InferenceConfig
+
+
+class Go2Timing(Settings):
+    state_timeout_seconds: PositiveSeconds = 0.5
+    stand_timeout_seconds: PositiveSeconds = 10.0
+    down_timeout_seconds: PositiveSeconds = 10.0
+
+
+class ExecutorMotion(Settings):
+    # Deliberately low caps for first hardware trials; the Go2 contract allows more.
+    forward_speed_mps: Annotated[float, Field(strict=True, gt=0, le=1.0, allow_inf_nan=False)] = 0.3
+    max_yaw_rate_rps: Annotated[float, Field(strict=True, gt=0, le=1.5, allow_inf_nan=False)] = 0.6
+    lookahead_distance_m: PositiveSeconds = 0.4
+    goal_tolerance_m: PositiveSeconds = 0.05
+    slowdown_distance_m: PositiveSeconds = 0.2
+    rotate_threshold_rad: PositiveSeconds = 0.6
+
+    def pure_pursuit(self) -> PurePursuitConfig:
+        return PurePursuitConfig(**self.model_dump())
+
+
+class GoalSettings(Settings):
+    arrival_tolerance_m: PositiveSeconds = 0.5
+    turn_tolerance_rad: PositiveSeconds = 0.05
+
+
+class ExecutorConfig(Settings):
+    camera_calibration: Annotated[StrictStr, Field(min_length=1)]
+    pose_source: Literal["dead_reckoning", "go2"] = "dead_reckoning"
+    allow_assumed_calibration: StrictBool = False
+    selection: Literal["medoid", "index"] = "medoid"
+    candidate_index: Annotated[int, Field(strict=True, ge=0)] = 0
+    min_path_length_m: Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)] = 0.05
+    control_frequency_hz: Annotated[float, Field(strict=True, ge=10, le=100, allow_inf_nan=False)] = 20.0
+    node_state_timeout_seconds: PositiveSeconds = 1.0
+    result_validity_seconds: PositiveSeconds = 3.0
+    shutdown_timeout_seconds: PositiveSeconds = 15.0
+    go2: Go2Timing = Field(default_factory=Go2Timing)
+    motion: ExecutorMotion = Field(default_factory=ExecutorMotion)
+    goal: GoalSettings = Field(default_factory=GoalSettings)
+
+    @model_validator(mode="after")
+    def valid_controller(self):
+        self.motion.pure_pursuit()
+        if self.shutdown_timeout_seconds <= self.go2.down_timeout_seconds:
+            raise ValueError("shutdown timeout must exceed the Go2 down timeout")
+        return self
+
+
+class CliSettings(Settings):
+    heartbeat_interval_seconds: PositiveSeconds = 0.2
+    state_timeout_seconds: PositiveSeconds = 1.0
+    command_timeout_seconds: PositiveSeconds = 15.0
+
+
+class VamosConfig(Settings):
+    keys: KeysConfig = Field(default_factory=KeysConfig)
+    zenoh: ZenohConnections
+    node: NodeSettings
+    executor: ExecutorConfig
+    cli: CliSettings = Field(default_factory=CliSettings)
+
+    @model_validator(mode="after")
+    def consistent(self):
+        self.node_config()  # Key collisions and periods are checked by the node model.
+        if self.cli.heartbeat_interval_seconds >= self.node.cli_heartbeat_timeout_seconds:
+            raise ValueError("cli.heartbeat_interval_seconds must be below node.cli_heartbeat_timeout_seconds")
+        return self
+
+    def node_config(self) -> NodeConfig:
+        """The node's runtime view: keys, freshness limits and inference settings."""
+        return NodeConfig(
+            zenoh_key_prefix=self.keys.prefix,
+            node_state_publish_frequency_hz=self.node.state_publish_frequency_hz,
+            cli_heartbeat_timeout_seconds=self.node.cli_heartbeat_timeout_seconds,
+            camera=CameraConfig(key=self.keys.camera, frame_freshness_seconds=self.node.camera_freshness_seconds),
+            go2=Go2Config(zenoh_key_prefix=self.keys.go2_prefix,
+                          node_state_timeout_seconds=self.node.go2_state_timeout_seconds),
+            inference=self.node.inference,
+        )
+
+
+def load_config(path: Path = DEFAULT_CONFIG_PATH) -> VamosConfig:
+    """Load and validate the settings file; relative calibration paths follow the file."""
+    if not path.is_file():
+        hint = (f"; copy {EXAMPLE_CONFIG_PATH.name} to {path.name} and edit it"
+                if path == DEFAULT_CONFIG_PATH else "")
+        raise ValueError(f"settings file not found: {path}{hint}")
     document = json5.loads(path.read_text(encoding="utf-8"), allow_duplicate_keys=False)
-    return NodeConfig.model_validate(document)
+    try:
+        config = VamosConfig.model_validate(document)
+    except ValueError as error:
+        raise ValueError(f"{path}: {error}") from error
+    calibration = Path(config.executor.camera_calibration)
+    if not calibration.is_absolute():
+        calibration = (path.resolve().parent / calibration).resolve()
+        executor = config.executor.model_copy(update={"camera_calibration": str(calibration)})
+        config = config.model_copy(update={"executor": executor})
+    return config

@@ -1,0 +1,32 @@
+// Robot-free demo only (cli.py --demo): the real node and go2_executor.py with
+// tools/fake_camera.py and tools/fake_go2.py on localhost, using the ASSUMED
+// example calibration. Never use this file with a real Go2.
+{
+  zenoh: {
+    node: {
+      mode: "peer",
+      listen: { endpoints: ["tcp/127.0.0.1:7447"] },
+      scouting: { multicast: { enabled: false } },
+    },
+    client: {
+      mode: "client",
+      connect: { endpoints: ["tcp/127.0.0.1:7447"] },
+      scouting: { multicast: { enabled: false } },
+    },
+  },
+  node: {
+    inference: {
+      num_samples: 5,
+      // A point on the paved path in test_images/texas_person.jpg.
+      goal: {
+        x: 0.434,
+        y: 0.514,
+        instruction: "Make a sharp right arc to avoid the people in front. Move along that arc towards the goal keeping the people to the left of you.",
+      },
+    },
+  },
+  executor: {
+    camera_calibration: "../ground-camera.example.json",
+    allow_assumed_calibration: true,
+  },
+}

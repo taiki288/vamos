@@ -7,7 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -16,16 +16,39 @@ import zenoh
 
 import cli
 from cli import CliRuntime
-from config import NodeConfig
+from config import DEMO_CONFIG_PATH, NodeConfig
 from launcher import HERE, ManagedProcesses, check_listener_available, listener_addresses
 from test_transport import BASE_CONFIG
+
+
+TRANSPORT_NODE = """
+import sys
+from pathlib import Path
+sys.path.insert(0, {zenoh!r})
+import zenoh
+from config import NodeConfig
+from node import NodeRuntime, stop_on_signals
+config = NodeConfig.model_validate_json(Path(sys.argv[1]).read_text())
+with stop_on_signals() as stop:
+    NodeRuntime(config).run(zenoh.Config.from_file(sys.argv[2]), stop)
+"""
+
+
+def settings_file(endpoint: str) -> dict:
+    """A minimal settings file whose node listens on, and clients connect to, endpoint."""
+    off = {"multicast": {"enabled": False}}
+    return {"zenoh": {"node": {"mode": "peer", "listen": {"endpoints": [endpoint]}, "scouting": off},
+                      "client": {"mode": "client", "connect": {"endpoints": [endpoint]}, "scouting": off}},
+            "node": {"inference": {"device": "cpu", "goal": {"x": 0.5, "y": 0.6}}},
+            "executor": {"camera_calibration": "ground-camera.json"}}
 
 
 class LauncherTests(unittest.TestCase):
     def test_cli_modes_launch_only_the_requested_services(self):
         demo = ["node", "camera", "go2", "executor"]
-        for flags, expected in (([], ["node"]), (["--demo"], demo), (["--demo", "--viewer", "--simulator"],
-                [*demo, "viewer"]), (["--attach"], [])):
+        settings = ["--config", str(DEMO_CONFIG_PATH)]
+        for flags, expected in ((settings, ["node"]), (["--demo"], demo), (["--demo", "--viewer", "--simulator"],
+                [*demo, "viewer"]), ([*settings, "--attach"], [])):
             with self.subTest(flags=flags), patch.object(sys, "argv", ["cli.py", *flags]), \
                     patch.object(cli, "ManagedProcesses") as manager, \
                     patch.object(cli, "CliRuntime") as runtime, \
@@ -34,14 +57,11 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(cli.main(), 0)
                 self.assertEqual([call.args[0] for call in owned.start.call_args_list], expected)
                 for call in owned.start.call_args_list:
-                    if call.args[0] == "node":
-                        self.assertIn(HERE / "inference-node-config.example.json5", call.args)
+                    self.assertEqual(call.args[2:4], ("--config", DEMO_CONFIG_PATH.resolve()))  # One file for all.
                     if call.args[0] == "camera":
                         self.assertNotIn("--heartbeat", call.args)  # The CLI owns heartbeat.
                     if call.args[0] == "go2":
                         self.assertEqual("--headless" in call.args, "--simulator" not in flags)
-                    if call.args[0] == "executor":
-                        self.assertIn(HERE / "tools/demo-executor-config.json5", call.args)
                 runtime.return_value.run.assert_called_once()
                 manager.return_value.__exit__.assert_called_once()
 
@@ -50,9 +70,9 @@ class LauncherTests(unittest.TestCase):
             listener.bind(("127.0.0.1", 0))
             listener.listen()
             port = listener.getsockname()[1]
-            path = Path(directory) / "server.json"
-            path.write_text(json.dumps({"listen": {"endpoints": [f"tcp/127.0.0.1:{port}"]}}))
-            with patch.object(sys, "argv", ["cli.py", "--node-zenoh-config", str(path)]), \
+            path = Path(directory) / "vamos.json5"
+            path.write_text(json.dumps(settings_file(f"tcp/127.0.0.1:{port}")))
+            with patch.object(sys, "argv", ["cli.py", "--config", str(path)]), \
                     patch.object(cli, "CliRuntime") as runtime, self.assertLogs(level="ERROR") as logs:
                 self.assertEqual(cli.main(), 1)
             runtime.return_value.run.assert_not_called()
@@ -60,10 +80,15 @@ class LauncherTests(unittest.TestCase):
             with socket.create_connection(("127.0.0.1", port), timeout=1):
                 pass  # The external listener is still alive.
 
-    def test_local_startup_rejects_transport_only_configuration(self):
-        with patch.object(sys, "argv", ["cli.py", "--node-config", str(HERE / "node-config.example.json5")]), \
-                self.assertLogs(level="ERROR"):
-            self.assertEqual(cli.main(), 1)
+    def test_missing_or_invalid_settings_file_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            invalid = Path(directory) / "invalid.json5"
+            invalid.write_text(json.dumps({**settings_file("tcp/127.0.0.1:7447"), "unknown": 1}))
+            for path, message in ((Path(directory) / "missing.json5", "not found"), (invalid, "unknown")):
+                with self.subTest(path=path.name), patch.object(sys, "argv", ["cli.py", "--config", str(path)]), \
+                        self.assertLogs(level="ERROR") as logs:
+                    self.assertEqual(cli.main(), 1)
+                self.assertIn(message, " ".join(logs.output))
 
     def test_owned_node_and_source_stop_even_after_operator_error(self):
         with tempfile.TemporaryDirectory() as directory, socket.socket() as available:
@@ -71,23 +96,24 @@ class LauncherTests(unittest.TestCase):
             available.bind(("127.0.0.1", 0))
             endpoint = f"tcp/127.0.0.1:{available.getsockname()[1]}"
             available.close()
-            server = work / "server.json"
-            client = work / "client.json"
-            server.write_text(json.dumps({"mode": "peer", "listen": {"endpoints": [endpoint]},
-                                         "scouting": {"multicast": {"enabled": False}}}))
-            client.write_text(json.dumps({"mode": "client", "connect": {"endpoints": [endpoint]},
-                                         "scouting": {"multicast": {"enabled": False}}}))
+            settings = settings_file(endpoint)
+            (work / "vamos.json5").write_text(json.dumps(settings))
+            (work / "transport.json").write_text(json.dumps(BASE_CONFIG))
+            (work / "server.json").write_text(json.dumps(settings["zenoh"]["node"]))
+            # A transport-only node: this test is about process ownership, not model loading.
+            node_script = work / "transport_node.py"
+            node_script.write_text(TRANSPORT_NODE.format(zenoh=str(HERE)), encoding="utf-8")
             manager = ManagedProcesses(work / "logs", shutdown_timeout=10, output=lambda _: None)
             descendants = []
             with self.assertRaisesRegex(RuntimeError, "operator error"):
                 with manager:
-                    addresses = listener_addresses(server)
+                    addresses = listener_addresses(settings["zenoh"]["node"])
                     check_listener_available(addresses)
-                    manager.start("node", HERE / "node.py", "--zenoh-config", server)
+                    manager.start("node", node_script, work / "transport.json", work / "server.json")
                     manager.wait_for_listener(addresses)
-                    manager.start("camera", HERE / "tools/fake_camera.py", "--zenoh-config", client)
+                    manager.start("camera", HERE / "tools/fake_camera.py", "--config", work / "vamos.json5")
                     operator = CliRuntime(NodeConfig.model_validate(BASE_CONFIG), output=lambda _: None)
-                    with operator.connect(zenoh.Config.from_file(str(client))):
+                    with operator.connect(zenoh.Config.from_json5(json.dumps(settings["zenoh"]["client"]))):
                         state = operator.cache.wait(lambda s: s.camera.fresh, 8)
                         self.assertIsNotNone(state)
                         self.assertTrue(state.cli_connected)

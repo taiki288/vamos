@@ -12,7 +12,6 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 
-import json5
 import psutil
 
 
@@ -20,8 +19,8 @@ STOP_FILE_ENV = "VAMOS_MANAGED_STOP_FILE"
 HERE = Path(__file__).resolve().parent
 
 
-def listener_addresses(path: Path) -> list[tuple[str, int]]:
-    settings = json5.loads(path.read_text(encoding="utf-8"), allow_duplicate_keys=False)
+def listener_addresses(settings: dict) -> list[tuple[str, int]]:
+    """TCP listen endpoints from the node's Zenoh session config."""
     addresses = []
     for endpoint in settings.get("listen", {}).get("endpoints", []):
         if not endpoint.startswith("tcp/"):

@@ -305,24 +305,17 @@ class ExecutorConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             (directory / "camera.json").write_text(json.dumps(CAMERA.as_json()), encoding="utf-8")
-            config = ExecutorConfig(camera_calibration="camera.json")
+            config = ExecutorConfig(camera_calibration=str(directory / "camera.json"))
             with self.assertRaisesRegex(ValueError, "not verified"):
-                load_camera(config, directory / "executor.json5")
+                load_camera(config)
             allowed = config.model_copy(update={"allow_assumed_calibration": True})
-            self.assertEqual(load_camera(allowed, directory / "executor.json5"), CAMERA)
+            self.assertEqual(load_camera(allowed), CAMERA)
 
     def test_invalid_rates_and_speeds_are_rejected(self):
         for changes in ({"control_frequency_hz": 4.0}, {"motion": {"forward_speed_mps": 2.0}},
                         {"shutdown_timeout_seconds": 5.0}, {"selection": "best"}):
             with self.subTest(changes=changes), self.assertRaises(ValidationError):
                 ExecutorConfig.model_validate({"camera_calibration": "c.json", **changes})
-
-    def test_example_config_is_valid(self):
-        example = Path(__file__).resolve().parents[1] / "go2-executor-config.example.json5"
-        from go2_executor import load_executor_config
-
-        config = load_executor_config(example)
-        self.assertFalse(config.allow_assumed_calibration)
 
 
 class ExecutorNetworkTests(unittest.TestCase):

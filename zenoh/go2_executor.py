@@ -37,18 +37,16 @@ import math
 from pathlib import Path
 from threading import Event, RLock
 import time
-from typing import Annotated, Callable, Literal
+from typing import Callable, Literal
 from uuid import uuid4
 
-import json5
-from pydantic import Field, StrictBool, StrictStr, model_validator
 import zenoh
 
 from config import (
-    ControlCommand, ExecutorState, Go2NodeState, JSON_ENCODING, NodeConfig, NodeState,
-    PlanarPose, PositiveSeconds, Settings, StopGoConfig, TrajectoryResult, load_node_config,
+    DEFAULT_CONFIG_PATH, ControlCommand, ExecutorConfig, ExecutorState, Go2NodeState, JSON_ENCODING, NodeConfig,
+    NodeState, PlanarPose, StopGoConfig, TrajectoryResult, load_config,
 )
-from controller import Pose2D, PurePursuitConfig, PurePursuitController, VelocityCommand
+from controller import Pose2D, PurePursuitController, VelocityCommand
 from projection import GroundCamera, GroundProjector, path_to_world
 from selection import select_candidate
 
@@ -66,64 +64,13 @@ def wrap(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
-class Go2Timing(Settings):
-    state_timeout_seconds: PositiveSeconds = 0.5
-    stand_timeout_seconds: PositiveSeconds = 10.0
-    down_timeout_seconds: PositiveSeconds = 10.0
-
-
-class ExecutorMotion(Settings):
-    # Deliberately low caps for first hardware trials; the Go2 contract allows more.
-    forward_speed_mps: Annotated[float, Field(strict=True, gt=0, le=1.0, allow_inf_nan=False)] = 0.3
-    max_yaw_rate_rps: Annotated[float, Field(strict=True, gt=0, le=1.5, allow_inf_nan=False)] = 0.6
-    lookahead_distance_m: PositiveSeconds = 0.4
-    goal_tolerance_m: PositiveSeconds = 0.05
-    slowdown_distance_m: PositiveSeconds = 0.2
-    rotate_threshold_rad: PositiveSeconds = 0.6
-
-    def pure_pursuit(self) -> PurePursuitConfig:
-        return PurePursuitConfig(**self.model_dump())
-
-
-class GoalSettings(Settings):
-    arrival_tolerance_m: PositiveSeconds = 0.5
-    turn_tolerance_rad: PositiveSeconds = 0.05
-
-
-class ExecutorConfig(Settings):
-    camera_calibration: Annotated[StrictStr, Field(min_length=1)]
-    pose_source: Literal["dead_reckoning", "go2"] = "dead_reckoning"
-    allow_assumed_calibration: StrictBool = False
-    selection: Literal["medoid", "index"] = "medoid"
-    candidate_index: Annotated[int, Field(strict=True, ge=0)] = 0
-    min_path_length_m: Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)] = 0.05
-    control_frequency_hz: Annotated[float, Field(strict=True, ge=10, le=100, allow_inf_nan=False)] = 20.0
-    node_state_timeout_seconds: PositiveSeconds = 1.0
-    result_validity_seconds: PositiveSeconds = 3.0
-    shutdown_timeout_seconds: PositiveSeconds = 15.0
-    go2: Go2Timing = Field(default_factory=Go2Timing)
-    motion: ExecutorMotion = Field(default_factory=ExecutorMotion)
-    goal: GoalSettings = Field(default_factory=GoalSettings)
-
-    @model_validator(mode="after")
-    def valid_controller(self):
-        self.motion.pure_pursuit()
-        if self.shutdown_timeout_seconds <= self.go2.down_timeout_seconds:
-            raise ValueError("shutdown timeout must exceed the Go2 down timeout")
-        return self
-
-
-def load_executor_config(path: Path) -> ExecutorConfig:
-    return ExecutorConfig.model_validate(json5.loads(path.read_text(encoding="utf-8"), allow_duplicate_keys=False))
-
-
-def load_camera(config: ExecutorConfig, config_path: Path) -> GroundCamera:
-    path = Path(config.camera_calibration)
-    camera = GroundCamera.load(path if path.is_absolute() else config_path.parent / path)
+def load_camera(config: ExecutorConfig) -> GroundCamera:
+    """Load the calibration named by the executor settings (an absolute path after load_config)."""
+    camera = GroundCamera.load(Path(config.camera_calibration))
     if camera.calibration_status != "calibrated" and not config.allow_assumed_calibration:
         raise ValueError("camera calibration is not verified (calibration_status != calibrated); run "
-                         "calibrate_camera.py verify --mark-calibrated, or set allow_assumed_calibration "
-                         "for robot-free tests only")
+                         "tools/calibrate_camera.py verify --mark-calibrated, or set "
+                         "executor.allow_assumed_calibration for robot-free tests only")
     return camera
 
 
@@ -678,21 +625,15 @@ def main() -> int:
     tolerate_unencodable_output()
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--node-config", type=Path, default=HERE / "inference-node-config.example.json5",
-                        help="VAMOS node settings: keys and stop-go step bounds")
-    parser.add_argument("--executor-config", type=Path, default=HERE / "go2-executor-config.example.json5")
-    parser.add_argument("--zenoh-config", type=Path, default=HERE / "peer-zenoh-config.example.json5")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Settings file (default zenoh/vamos.json5)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     try:
-        node_config = load_node_config(args.node_config)
-        if node_config.inference is None:
-            raise ValueError("the Go2 executor requires a node config with an inference section")
-        config = load_executor_config(args.executor_config)
-        camera = load_camera(config, args.executor_config)
-        executor = Go2StepExecutor(config, node_config.inference.stop_go, camera)
+        config = load_config(args.config)
+        node_config = config.node_config()
+        executor = Go2StepExecutor(config.executor, node_config.inference.stop_go, load_camera(config.executor))
         with stop_on_signals() as stop:
-            ExecutorRuntime(executor, node_config).run(zenoh.Config.from_file(str(args.zenoh_config)), stop)
+            ExecutorRuntime(executor, node_config).run(config.zenoh.session("client"), stop)
     except (OSError, ValueError, RuntimeError, zenoh.ZError) as error:
         LOGGER.error("%s", error)
         return 1

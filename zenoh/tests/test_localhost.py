@@ -46,14 +46,14 @@ from pathlib import Path
 from threading import Event, Thread
 sys.path.insert(0, sys.argv[1])
 import zenoh
-from config import load_node_config
+from config import NodeConfig
 from node import NodeRuntime
 stop = Event()
 def wait_for_parent():
     sys.stdin.readline()
     stop.set()
 Thread(target=wait_for_parent, daemon=True).start()
-NodeRuntime(load_node_config(Path(sys.argv[2]))).run(zenoh.Config.from_file(sys.argv[3]), stop)
+NodeRuntime(NodeConfig.model_validate_json(Path(sys.argv[2]).read_text())).run(zenoh.Config.from_file(sys.argv[3]), stop)
 """
             try:
                 process = subprocess.Popen(

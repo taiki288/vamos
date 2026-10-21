@@ -13,14 +13,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import zenoh
 
-from config import JPEG_ENCODING, load_node_config
-from node import HERE, stop_on_signals
+from config import DEFAULT_CONFIG_PATH, JPEG_ENCODING, load_config
+from node import stop_on_signals
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--node-config", type=Path, default=HERE / "node-config.example.json5")
-    parser.add_argument("--zenoh-config", type=Path, default=HERE / "peer-zenoh-config.example.json5")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Settings file (default zenoh/vamos.json5)")
     args = parser.parse_args()
     # GUI dependencies are not imported by transport-only nodes/tests.
     import cv2
@@ -38,8 +37,9 @@ def main() -> int:
     title = "VAMOS paths - Q / Esc to close"
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     try:
-        config = load_node_config(args.node_config)
-        with stop_on_signals() as stop, zenoh.open(zenoh.Config.from_file(str(args.zenoh_config))) as session:
+        settings = load_config(args.config)
+        config = settings.node_config()
+        with stop_on_signals() as stop, zenoh.open(settings.zenoh.session("client")) as session:
             with session.declare_subscriber(config.keys()["preview"], on_preview):
                 cv2.namedWindow(title, cv2.WINDOW_NORMAL)
                 logging.info("Waiting for %s", config.keys()["preview"])

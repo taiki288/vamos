@@ -25,8 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import zenoh
 
-from config import ExecutorState, JSON_ENCODING, load_node_config
-from node import HERE, has_encoding, stop_on_signals
+from config import DEFAULT_CONFIG_PATH, ExecutorState, JSON_ENCODING, load_config
+from node import has_encoding, stop_on_signals
 
 STANDING = ("ready_stand", "locomotion")
 VELOCITY_TIMEOUT_SECONDS = 0.25
@@ -187,9 +187,7 @@ def serve(robot: SimulatedGo2, keys: dict, session: zenoh.Session, stop, view: S
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--node-config", type=Path, default=HERE / "inference-node-config.example.json5",
-                        help="VAMOS node config, for the Go2 and executor keys")
-    parser.add_argument("--zenoh-config", type=Path, default=HERE / "peer-zenoh-config.example.json5")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Settings file (default zenoh/vamos.json5)")
     parser.add_argument("--initial-state", choices=("down", "damping", "ready_stand"), default="down")
     parser.add_argument("--posture-seconds", type=float, default=1.0, help="Duration of stand/down transitions")
     parser.add_argument("--headless", action="store_true", help="No window; print the final pose on exit")
@@ -197,9 +195,10 @@ def main() -> int:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     try:
-        keys = load_node_config(args.node_config).keys()
+        config = load_config(args.config)
+        keys = config.node_config().keys()
         robot = SimulatedGo2(args.initial_state, args.posture_seconds, publish_pose=not args.no_pose)
-        with stop_on_signals() as stop, zenoh.open(zenoh.Config.from_file(str(args.zenoh_config))) as session:
+        with stop_on_signals() as stop, zenoh.open(config.zenoh.session("client")) as session:
             logging.info("SIMULATED Go2 on %s (%s). Ctrl+C to stop.", keys["go2_state"], args.initial_state)
             serve(robot, keys, session, stop, None if args.headless else SimulatorView(robot))
         print(json.dumps({"state": robot.state, "pose": {"x": robot.x, "y": robot.y, "yaw": robot.yaw}}))
