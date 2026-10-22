@@ -67,6 +67,23 @@ Orin (Ampere) supports. Model loading and inference latency on the Jetson have
 not been measured yet; see [zenoh/README.md](zenoh/README.md) for the
 deployment checklist.
 
+### Older NVIDIA GPUs (Pascal, e.g. P100)
+
+The default Linux x86_64 Torch wheels from PyPI are built for CUDA 13, which no
+longer supports Pascal (`sm_60`/`sm_61`). On such hosts opt in to the CUDA 12.6
+build with the `cu126` extra, and pass it to every `uv run` as well (otherwise
+uv re-syncs to the default build):
+
+   ```bash
+   uv sync --group zenoh --extra cu126
+   uv run --extra cu126 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_arch_list())"
+   ```
+
+The arch list must include `sm_60`. Pascal GPUs have no bfloat16, so keep
+`node.inference.dtype: "auto"` (it selects float32 there; about 12 GB of
+weights, which fits a 16 GB P100). The `pypi-torch` extra only exists to name
+the default build in uv's conflict declaration and never needs to be passed.
+
 ### Conda Alternative
 
 If you prefer the original Conda flow:

@@ -21,6 +21,13 @@ dependencies = [
     "transformers>=4.30.0",
 ]
 
+[project.optional-dependencies]
+# Opt-in CUDA 12.6 torch build for Linux x86_64 GPUs older than Volta (e.g.
+# P100): `uv sync --extra cu126 ...`. Pass `--extra cu126` to every `uv run`
+# too, or uv re-syncs back to the default build.
+cu126 = ["torch>=2.0.0", "torchvision>=0.15.0"]
+pypi-torch = []
+
 [dependency-groups]
 zenoh = [
     "eclipse-zenoh>=1.0,<2",
@@ -52,14 +59,18 @@ ros = [
 [tool.uv.sources]
 # Windows dev machines use the CUDA 12.8 wheels. Jetson AGX Orin (JetPack 7.2,
 # L4T r39.2, aarch64/SBSA) uses the CUDA 13.2 index, as in the NaVILA fork.
-# Other Linux x86_64 hosts keep resolving torch from PyPI.
+# Other Linux x86_64 hosts keep resolving torch from PyPI (CUDA 13), unless the
+# opt-in `cu126` extra selects the CUDA 12.6 wheels, which still support
+# pre-Volta GPUs such as the Pascal P100 (sm_60) that CUDA 13 dropped.
 torch = [
     { index = "pytorch-cu128", marker = "sys_platform == 'win32' and platform_machine == 'AMD64'" },
     { index = "pytorch-cu132", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
+    { index = "pytorch-cu126", extra = "cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
 torchvision = [
     { index = "pytorch-cu128", marker = "sys_platform == 'win32' and platform_machine == 'AMD64'" },
     { index = "pytorch-cu132", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
+    { index = "pytorch-cu126", extra = "cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
 trajectory-prediction = { path = "vamos_ws/src/trajectory_prediction", editable = true }
 trajectory-projection = { path = "vamos_ws/src/trajectory_projection", editable = true }
@@ -70,10 +81,18 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
 name = "pytorch-cu132"
 url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
 [tool.uv]
 default-groups = []
+# uv needs at least two members per conflict set; `pypi-torch` is the explicit
+# name for the default torch build and never has to be passed.
+conflicts = [[{ extra = "cu126" }, { extra = "pypi-torch" }]]
 package = false
