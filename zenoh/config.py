@@ -126,6 +126,9 @@ class InferenceConfig(Settings):
     stop_go: StopGoConfig = Field(default_factory=StopGoConfig)
     model_key: Annotated[StrictStr, Field(min_length=1)] = "mateoguaman/vamos"
     device: Literal["auto", "cuda", "cpu"] = "cuda"
+    # "auto" keeps bfloat16 except on CUDA GPUs older than Ampere (compute
+    # capability < 8.0, e.g. Pascal P100), which lack bfloat16 and use float32.
+    dtype: Literal["auto", "bfloat16", "float32"] = "auto"
     num_samples: Annotated[int, Field(strict=True, ge=1, le=50)] = 10
     max_new_tokens: Annotated[int, Field(strict=True, ge=2, le=128)] = 10
     temperature: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.05

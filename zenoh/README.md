@@ -296,7 +296,7 @@ required; everything else has a default (see `config.py`), and
 | `keys.prefix`, `keys.camera`, `keys.go2_prefix` | `vamos/...`, the camera key, and the Go2 node prefix |
 | `zenoh.node`, `zenoh.client` | Zenoh session configs for the node's listener and for every other process |
 | `node.camera_freshness_seconds`, `node.cli_heartbeat_timeout_seconds`, `node.go2_state_timeout_seconds` | Input freshness; camera/heartbeat expiry pauses the run |
-| `node.inference.num_samples`, `max_new_tokens`, `temperature`, `disable_compile`, `device`, `model_key` | VAMOS generation |
+| `node.inference.num_samples`, `max_new_tokens`, `temperature`, `disable_compile`, `device`, `dtype`, `model_key` | VAMOS generation |
 | `node.inference.goal` | Default goal: `x`/`y` image fractions or `forward_m`/`left_m`, plus instruction |
 | `node.inference.stop_go.max_step_seconds` / `max_step_distance_m` / `max_step_yaw_rad` | Step bounds |
 | `node.inference.stop_go.stop_settle_seconds` | Required quiescent standing time before `stopped` |

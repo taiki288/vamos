@@ -9,6 +9,7 @@ import socket
 import sys
 from threading import Event, Thread
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
@@ -19,7 +20,7 @@ from pydantic import ValidationError
 import zenoh
 
 from config import ControlCommand, InferenceConfig, NodeConfig, NodeState, TrajectoryResult
-from inference import InferenceOutput, VAMOSEngine, build_prompt, render_preview
+from inference import InferenceOutput, VAMOSEngine, build_prompt, render_preview, resolve_dtype
 from node import NodeRuntime, TransportState
 from stop_go_support import EchoExecutor, report_stopped
 from test_transport import BASE_CONFIG, image_bytes, wait_for_listener
@@ -148,6 +149,28 @@ class InferenceTests(unittest.TestCase):
             self.assertEqual(image.format, "JPEG")
             self.assertEqual(image.size, (64, 48))
         self.assertEqual(TrajectoryResult.model_validate_json(result.model_dump_json()), result)
+
+
+class DtypeTests(unittest.TestCase):
+    def fake_torch(self, capability):
+        return SimpleNamespace(float32="fp32", bfloat16="bf16",
+                               cuda=SimpleNamespace(get_device_capability=lambda device: capability))
+
+    def test_auto_uses_float32_only_on_pre_ampere_cuda(self):
+        self.assertEqual(resolve_dtype("auto", "cuda", self.fake_torch((6, 0))), "fp32")  # P100
+        self.assertEqual(resolve_dtype("auto", "cuda", self.fake_torch((8, 7))), "bf16")  # Orin
+        self.assertEqual(resolve_dtype("auto", "cuda", self.fake_torch((12, 0))), "bf16")
+        self.assertEqual(resolve_dtype("auto", "cpu", self.fake_torch((6, 0))), "bf16")
+
+    def test_explicit_dtype_is_honored(self):
+        torch = self.fake_torch((6, 0))
+        self.assertEqual(resolve_dtype("bfloat16", "cuda", torch), "bf16")
+        self.assertEqual(resolve_dtype("float32", "cuda", self.fake_torch((8, 7))), "fp32")
+
+    def test_config_defaults_to_auto_and_rejects_unknown_dtype(self):
+        self.assertEqual(InferenceConfig.model_validate(INFERENCE).dtype, "auto")
+        with self.assertRaises(ValidationError):
+            InferenceConfig.model_validate({**INFERENCE, "dtype": "float16"})
 
 
 class InferenceNetworkTests(unittest.TestCase):

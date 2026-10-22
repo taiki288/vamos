@@ -29,6 +29,19 @@ def build_prompt(config: InferenceConfig, goal: GoalConfig | None = None) -> str
     return f"{prompt} {instruction}" if instruction else prompt
 
 
+def resolve_dtype(name: str, device: str, torch):
+    """Map the configured dtype name to a torch dtype for the chosen device."""
+    if name == "float32":
+        return torch.float32
+    if name == "bfloat16":
+        return torch.bfloat16
+    if device.startswith("cuda"):
+        major, _ = torch.cuda.get_device_capability(device)
+        if major < 8:
+            return torch.float32
+    return torch.bfloat16
+
+
 class VAMOSEngine:
     def __init__(self, model, processor, device, generate, config: InferenceConfig):
         self.model, self.processor, self.device = model, processor, device
@@ -49,7 +62,10 @@ class VAMOSEngine:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         if device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is unavailable in this Python environment")
-        model, processor, actual_device = load_vamos_model(config.model_key, device=device)
+        dtype = resolve_dtype(config.dtype, device, torch)
+        model, processor, actual_device = load_vamos_model(
+            config.model_key, device=device, torch_dtype=dtype
+        )
         if model is None or processor is None:
             raise RuntimeError(f"Could not load VAMOS model: {config.model_key}")
         model.eval()

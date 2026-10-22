@@ -14,7 +14,7 @@ from transformers import AutoProcessor, AutoModelForVision2Seq
 from peft import PeftConfig, PeftModel
 
 
-def load_vamos_model(model_name_or_path, use_fp32=False, trust_remote_code=True, device=None):
+def load_vamos_model(model_name_or_path, use_fp32=False, trust_remote_code=True, device=None, torch_dtype=None):
     """
     Load the VAMOS model and processor from Hugging Face.
     
@@ -23,6 +23,7 @@ def load_vamos_model(model_name_or_path, use_fp32=False, trust_remote_code=True,
         use_fp32: Use FP32 precision instead of bfloat16
         trust_remote_code: Trust remote code for model loading
         device: Optional explicit "cuda" or "cpu"; defaults to automatic selection
+        torch_dtype: Optional explicit torch dtype; overrides use_fp32 when given
     
     Returns:
         tuple: (model, processor, device) or (None, None, None) if failed
@@ -31,6 +32,9 @@ def load_vamos_model(model_name_or_path, use_fp32=False, trust_remote_code=True,
     
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥️  Using device: {device}")
+    if torch_dtype is None:
+        torch_dtype = torch.float32 if use_fp32 else torch.bfloat16
+    print(f"🔢 Using dtype: {torch_dtype}")
     
     try:
         if "lora" in model_name_or_path.lower():
@@ -47,7 +51,7 @@ def load_vamos_model(model_name_or_path, use_fp32=False, trust_remote_code=True,
             # Load base model first
             model = AutoModelForVision2Seq.from_pretrained(
                 base_model_name,
-                torch_dtype=torch.float32 if use_fp32 else torch.bfloat16,
+                torch_dtype=torch_dtype,
                 trust_remote_code=trust_remote_code
             ).to(device)
             
@@ -66,7 +70,7 @@ def load_vamos_model(model_name_or_path, use_fp32=False, trust_remote_code=True,
             
             model = AutoModelForVision2Seq.from_pretrained(
                 model_name_or_path,
-                torch_dtype=torch.float32 if use_fp32 else torch.bfloat16,
+                torch_dtype=torch_dtype,
                 trust_remote_code=trust_remote_code
             ).to(device)
             

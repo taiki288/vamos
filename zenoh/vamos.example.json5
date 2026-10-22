@@ -35,6 +35,7 @@
     inference: {
       model_key: "mateoguaman/vamos",
       device: "cuda", // "auto" or "cpu" may also be selected explicitly.
+      dtype: "auto", // bfloat16, or float32 on pre-Ampere GPUs (e.g. P100); "bfloat16"/"float32" force it.
       num_samples: 5,
       max_new_tokens: 10,
       temperature: 0.05,
